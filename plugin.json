@@ -1,10 +1,10 @@
 {
-    "name": "My plugin",
+    "name": "Provenance Pruning",
     "version": "0.0.1",
-    "description": "Description of my_plugin.",
-    "author_name": "Me",
-    "author_url": "https://mywebsite.me",
-    "plugin_url": "https://github.com/my_name/my_plugin",
-    "tags": "cat, template, example",
-    "thumb": "https://raw.githubusercontent.com/my_repo_path/my_plugin.png"
+    "description": "Advanced text pruning to reduce RAG hallucinations with Apple Silicon MPS optimization",
+    "author_name": "NuvolaProject",
+    "author_url": "https://nuvolaproject.cloud",
+    "plugin_url": "https://github.com/mc9625/cat_pruner",
+    "tags": "cat, template, example, performance, pruning, rag",
+    "thumb": "https://raw.githubusercontent.com/my_repo_path/provenance_pruning.png"
 }
