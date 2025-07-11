@@ -1,6 +1,6 @@
 {
     "name": "Provenance Pruning",
-    "version": "0.0.1",
+    "version": "1.0.0",
     "description": "Advanced text pruning to reduce RAG hallucinations with Apple Silicon MPS optimization",
     "author_name": "NuvolaProject",
     "author_url": "https://nuvolaproject.cloud",
