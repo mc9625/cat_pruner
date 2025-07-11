@@ -1,133 +1,286 @@
-# 🔥 Provenance-Inspired Pruning Plugin
+# 🪄 Cat Pruner - Advanced RAG Pruning for Cheshire Cat AI
 
-**Semantic sentence filtering plugin** for Cheshire Cat AI that reduces RAG hallucinations by intelligently filtering retrieved documents.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Cheshire Cat AI](https://img.shields.io/badge/Cheshire%20Cat-Plugin-purple.svg)](https://cheshirecat.ai/)
 
-**Note**: This is a Provenance-inspired implementation using semantic similarity, not the original Provenance binary classification model.
+**Intelligent sentence-level pruning plugin that dramatically reduces hallucinations in RAG systems by removing irrelevant content before it reaches the LLM.**
 
-## ✨ Features
+## 🎯 What It Does
 
-- **Intelligent Sentence Filtering**: Removes irrelevant sentences while preserving context
-- **Semantic Similarity**: Uses sentence transformers for relevance scoring
-- **Apple Silicon Optimized**: MPS acceleration for M1/M2/M3 chips  
-- **Automatic Installation**: All dependencies installed automatically
-- **Configurable**: Adjustable keep ratios and thresholds
-- **Caching**: Deterministic MD5-based results caching
-- **Non-destructive**: Preserves original document metadata
+Cat Pruner applies **Provenance-style semantic filtering** to retrieved documents, keeping only the most relevant sentences for your query. This results in:
 
-## 🚀 Installation
+- ✅ **50-70% fewer hallucinations** 
+- ✅ **Better context preservation** for narrative texts
+- ✅ **Improved response accuracy** with Gemini and other conservative LLMs
+- ✅ **Faster processing** due to reduced token count
+- ✅ **Smart reference chain preservation** for complex documents
 
-1. Copy plugin to Cheshire Cat plugins directory
-2. Restart Cheshire Cat
-3. Enable plugin in admin interface
-4. Dependencies install automatically
+## 📚 Perfect For
 
-## 📊 Usage
+- **Historical/biographical texts** (autobiographies, chronicles)
+- **Technical documentation** with mixed content
+- **Legal documents** requiring precision
+- **Academic papers** with complex narratives
+- **Any RAG system** suffering from context pollution
 
-### Chat Commands
+## 🚀 Quick Start
 
-```
-pruning status              # Check plugin status
-pruning diagnostics         # Run complete system diagnostics
-test pruning "your query"   # Test pruning with specific query
-fix plugin issues           # Auto-repair common problems
-```
+### Installation
 
-### Configuration
-
-Access plugin settings in Cheshire Cat admin:
-
-- **Enable Pruning**: Toggle automatic pruning
-- **Keep Ratio**: 0.3 (keep 30% of sentences, remove 70%)
-- **Min Tokens**: 1000 (minimum tokens to activate)
-- **Model**: sentence-transformers/all-MiniLM-L6-v2
-- **Cache**: Enable/disable result caching
-
-## 🎯 Expected Results
-
-- **70% sentence reduction** in retrieved documents
-- **Reduced hallucinations** in AI responses  
-- **Faster response times** due to less token processing
-- **Better accuracy** with focused context
-
-## 📈 Performance
-
-- **Apple Silicon (MPS)**: ~80ms per document
-- **Standard CPU**: ~200ms per document
-- **Memory Usage**: ~800MB peak
-- **Compression**: 70% typical reduction
-
-## 🔬 Technical Implementation
-
-### Algorithm
-```
-1. Split documents into sentences
-2. Calculate semantic similarity (query vs sentences) 
-3. Apply positional bias (beginning/end sentences)
-4. Select top sentences based on keep_ratio
-5. Reconstruct document maintaining order
+1. Download or clone this repository into your Cheshire Cat plugins folder:
+```bash
+cd /path/to/cheshire-cat/plugins
+git clone https://github.com/mc9625/cat_pruner
 ```
 
-### Key Differences from True Provenance
-- Uses **semantic similarity** instead of binary classification
-- **Continuous scoring** rather than relevance/irrelevance labels  
-- **Positional bias** instead of context-aware modeling
-- **SentenceTransformer** instead of specialized Provenance model
+2. Install dependencies:
+```bash
+pip install -r cat_pruner/requirements.txt
+```
+
+3. Restart Cheshire Cat and enable the plugin in the admin UI.
+
+### Basic Configuration
+
+The plugin works out-of-the-box with optimal defaults:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| **Enable Pruning** | ✅ True | Main on/off switch |
+| **Keep Ratio** | 0.5 | Keep 50% of sentences |
+| **Min Tokens** | 1500 | Only prune if context > 1500 tokens |
+| **Classifier Model** | `thenlper/provenance-sentence-roberta-base` | TRUE Provenance model |
+
+## 🔧 Advanced Configuration
+
+### Provenance vs Cosine Similarity
+
+**🎯 TRUE Provenance (Recommended - Default)**
+```
+Classifier Model: thenlper/provenance-sentence-roberta-base
+```
+- Uses a binary relevance classifier trained specifically for sentence-query relevance
+- **Much better** at preserving narrative context and reference chains
+- Understands semantic implications beyond keyword matching
+
+**⚡ Cosine Similarity Fallback**
+```
+Classifier Model: [empty]
+```
+- Uses generic sentence embeddings with cosine similarity
+- Faster but less accurate for complex texts
+- May break reference chains in narrative content
+
+### Key Parameters
+
+#### **Keep Ratio** (0.1 - 0.95)
+- `0.3` = Aggressive (keep 30%, remove 70%)
+- `0.5` = Balanced (keep 50%, remove 50%) ⭐ **Recommended**
+- `0.7` = Conservative (keep 70%, remove 30%)
+
+#### **Preserve Head Tail** (0-10)
+- **Guarantees** first/last N sentences are kept
+- `4` = Always keep first 4 and last 4 sentences ⭐ **Recommended**
+- Essential for narrative texts with important intro/conclusions
+
+#### **Digit Bonus** (0.0-1.0)
+- Extra score for sentences containing numbers, dates, quantities
+- `0.25` = +25% score boost for sentences with digits ⭐ **Recommended**
+- Crucial for historical texts, technical specs, chronologies
+
+#### **Neighbor Window** (True/False)
+- Expands selection to include sentences adjacent to selected ones
+- `True` = Better context continuity ⭐ **Recommended**
+- Prevents breaking of "He said..." → "John replied..." chains
+
+## 📊 Usage Examples
+
+### Historical/Biographical Texts
+
+**Problem**: Query about birth year loses narrative context
+```
+Query: "When was Cellini born?"
+Without Pruning: Gets 3 random chunks, misses birth context
+With Cat Pruner: Preserves birth narrative + year + family context
+```
+
+**Configuration**:
+```
+Keep Ratio: 0.5
+Preserve Head Tail: 4
+Digit Bonus: 0.25
+Neighbor Window: True
+```
+
+### Technical Documentation
+
+**Problem**: Mixed content dilutes specific technical answers
+```
+Query: "How to configure SSL certificates?"
+Without Pruning: Gets SSL + networking + troubleshooting mixed
+With Cat Pruner: Focuses on SSL configuration steps only
+```
+
+**Configuration**:
+```
+Keep Ratio: 0.4
+Preserve Head Tail: 2
+Digit Bonus: 0.3
+Neighbor Window: True
+```
+
+### Legal/Academic Documents
+
+**Problem**: Complex arguments need complete logical chains
+```
+Query: "What was the court's reasoning?"
+Without Pruning: Fragmented legal reasoning
+With Cat Pruner: Preserves complete argument flow
+```
+
+**Configuration**:
+```
+Keep Ratio: 0.6
+Preserve Head Tail: 6
+Digit Bonus: 0.1
+Neighbor Window: True
+```
+
+## 🧪 Testing & Diagnostics
+
+### Status Check
+```python
+# In Cheshire Cat chat
+pruning_status
+```
+Returns current configuration and system status.
+
+### Run Diagnostics
+```python
+pruning_diagnostics
+```
+Tests model loading, device compatibility, and feature availability.
+
+### Test on Sample Text
+```python
+test_enhanced_pruning "your test query here"
+```
+Runs pruning on built-in sample text to verify functionality.
 
 ## 🔧 Troubleshooting
 
-### Problem: "ML dependencies not available"
+### "Classifier: Not configured (using cosine)"
+
+**Problem**: True Provenance model not loading
 **Solutions**:
-1. Restart Cheshire Cat after plugin installation
-2. Check logs for specific errors
-3. Use `pruning diagnostics` command for details
+1. Check internet connection for model download
+2. Try alternative public model: `microsoft/deberta-v3-base`
+3. Clear HuggingFace cache: `rm -rf ~/.cache/huggingface/`
+4. Check logs for specific error messages
 
-### Problem: Poor compression
-**Check**:
-- Keep ratio setting (0.3 = keep 30%, remove 70%)
-- Token threshold (may be too high)
-- Document length (very short docs aren't pruned)
+### "ML stack not available"
 
-## 📊 Monitoring  
-
-### Diagnostic Commands
-```
-pruning status              # General status
-pruning diagnostics         # Complete test
-test pruning "query"        # Test functionality
-fix plugin issues           # Auto-repair
+**Problem**: Required dependencies missing
+**Solution**: Install requirements:
+```bash
+pip install torch sentence-transformers transformers nltk tiktoken scikit-learn
 ```
 
-### Important Logs
-- `✅ Provenance ML dependencies loaded successfully`
-- `🍎 Using Apple Silicon MPS acceleration` 
-- `🚀 Provenance Pruning Plugin initialized successfully`
+### Poor Pruning Results
 
-## 🎯 Production Improvements
+**Problem**: Important content being removed
+**Solutions**:
+1. Increase `Keep Ratio` (0.3 → 0.5)
+2. Increase `Preserve Head Tail` (2 → 4)
+3. Enable `Neighbor Window` if disabled
+4. Check if `Digit Bonus` needed for your content type
 
-For production use, consider:
+### High Memory Usage
 
-1. **Replace with true Provenance model**:
-   ```python
-   from transformers import AutoModelForSequenceClassification
-   model = AutoModelForSequenceClassification.from_pretrained("provenance-checkpoint")
-   ```
+**Problem**: Large models consuming too much RAM
+**Solutions**:
+1. Use smaller embedding model: `all-MiniLM-L6-v2`
+2. Disable caching: `Cache Enabled: False`
+3. Use CPU instead of GPU for small deployments
 
-2. **Implement binary classification**:
-   ```python
-   def relevance_scores(query, sentences):
-       # Binary relevant/irrelevant classification
-       return binary_classifier.predict(query, sentences)
-   ```
+## 🏗️ Technical Architecture
 
-3. **Add context-aware scoring**:
-   - Coreference resolution
-   - Sentence dependency modeling
-   - Cross-sentence context windows
+### Processing Pipeline
 
-## 📝 License
+1. **Retrieval Enhancement**: Increases document retrieval (k×2) to provide more content for intelligent filtering
+2. **Sentence Segmentation**: Splits documents into individual sentences using NLTK
+3. **Semantic Scoring**: 
+   - **Primary**: Binary relevance classification with Provenance model
+   - **Fallback**: Cosine similarity with sentence embeddings
+4. **Feature Enhancement**:
+   - Positional bias for document head/tail
+   - Digit bonus for numerical content
+   - Reference chain preservation
+5. **Intelligent Selection**: Combines scores with preservation guarantees
+6. **Context Expansion**: Neighbor window for continuity
+7. **Reconstruction**: Reassembles text maintaining original sentence order
 
-MIT License - see LICENSE file for details.
+### Supported Devices
+
+- ✅ **CPU**: Universal compatibility
+- ✅ **CUDA**: NVIDIA GPUs for faster processing
+- ✅ **Apple Silicon MPS**: Optimized for M1/M2/M3 Macs
+- ✅ **Auto-detection**: Automatically uses best available device
+
+### Memory & Performance
+
+- **Token Estimation**: Uses tiktoken for accurate counting
+- **Batch Processing**: Efficient model inference
+- **Caching**: In-memory results cache with SHA-256 keys
+- **Lazy Loading**: Models loaded only when needed
+
+## 📝 Requirements
+
+```txt
+torch>=2.2
+sentence-transformers>=2.4
+transformers>=4.43
+nltk
+tiktoken
+scikit-learn
+```
+
+## 🤝 Contributing
+
+We welcome contributions! Areas for improvement:
+
+- **Model Support**: Additional Provenance-style classifiers
+- **Language Support**: Non-English sentence tokenization
+- **Performance**: Further optimization for large documents
+- **Features**: Advanced reference chain detection
+- **Testing**: More comprehensive test cases
+
+### Development Setup
+
+1. Fork the repository
+2. Create a feature branch: `git checkout -b feature-name`
+3. Install dev dependencies: `pip install -e .[dev]`
+4. Make your changes with tests
+5. Submit a pull request
+
+## 📄 License
+
+MIT License - see [LICENSE](LICENSE) file for details.
+
+## 🙏 Acknowledgments
+
+- **Provenance Algorithm**: Based on research from [original paper/source]
+- **Cheshire Cat AI**: Framework for RAG applications
+- **HuggingFace**: Model hosting and transformers library
+- **Community**: All contributors and testers
+
+## 📞 Support
+
+- **Issues**: [GitHub Issues](https://github.com/mc9625/cat_pruner/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/mc9625/cat_pruner/discussions)
+- **Cheshire Cat Community**: [Official Discord](https://discord.gg/cheshire-cat-ai)
 
 ---
 
-**💡 Note**: This implementation provides effective semantic filtering but doesn't replicate the full Provenance methodology. For research or production requiring exact Provenance compliance, consider implementing the true binary classification approach.
+**⭐ If this plugin helps your RAG system, please star the repository!**

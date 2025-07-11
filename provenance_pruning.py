@@ -582,13 +582,3 @@ def after_cat_bootstrap(cat):
             log.error(f"Enhanced preload error: {e}")
 
     threading.Thread(target=_preload, daemon=True).start()
-
-# requirements.txt for this plugin:
-"""
-torch>=2.2
-sentence-transformers>=2.4
-transformers>=4.43
-nltk
-tiktoken
-scikit-learn
-"""
