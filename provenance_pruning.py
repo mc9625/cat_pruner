@@ -96,7 +96,7 @@ class ProvenanceSettings(BaseModel):
         description="🔒 Sentences GUARANTEED preserved from document start & end. Essential for narrative context.",
     )
     digit_bonus: float = Field(
-        0.45,
+        0.60,
         ge=0.0,
         le=1.0,
         description="🔢 Score bonus for sentences with numbers/dates/quantities (0.25 = +25% score). Great for chronologies.",
