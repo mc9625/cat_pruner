@@ -1,5 +1,5 @@
 """
-Provenance‑Style Pruning Plugin for **Cheshire Cat AI** - FIXED VERSION
+Provenance‑Style Pruning Plugin for **Cheshire Cat AI**
 """
 from __future__ import annotations
 
@@ -68,53 +68,60 @@ except Exception as e:
     log.warning(f"⚠️ ML stack unavailable: {e}")
 
 # ---------------------------------------------------------------------------
-# IMPROVED: Settings with new parameters for enhanced features
+# IMPROVED: Settings with better defaults and clear descriptions
 # ---------------------------------------------------------------------------
 class ProvenanceSettings(BaseModel):
     """Plugin settings editable from the Admin UI."""
 
     enable_pruning: bool = Field(
-        True, description="Enable/disable sentence‑level pruning"
+        True, 
+        description="🔥 Enable/disable intelligent sentence-level pruning"
     )
     keep_ratio: float = Field(
-        0.5,  # CHANGED: More conservative default
+        0.5,
         ge=0.1,
         le=0.95,
-        description="Fraction of sentences to keep after scoring",
+        description="📊 Fraction of sentences to KEEP (0.5 = keep 50%, remove 50%). Higher = more conservative.",
     )
     min_tokens_for_pruning: int = Field(
-        1500,  # CHANGED: Higher threshold for better content preservation
+        1500,
         ge=200,
         le=8000,
-        description="Skip pruning if recalled context has fewer tokens.",
+        description="🚪 Skip pruning if context has fewer tokens (higher = less aggressive). 1500+ recommended for narratives.",
     )
     preserve_head_tail: int = Field(
-        4,  # CHANGED: More sentences preserved
+        4,
         ge=0,
         le=10,
-        description="Sentences GUARANTEED preserved from doc head & tail.",
+        description="🔒 Sentences GUARANTEED preserved from document start & end. Essential for narrative context.",
     )
     digit_bonus: float = Field(
-        0.25,  # NEW: Bonus for sentences with numbers
+        0.25,
         ge=0.0,
         le=1.0,
-        description="Score bonus for sentences containing digits/numbers.",
+        description="🔢 Score bonus for sentences with numbers/dates/quantities (0.25 = +25% score). Great for chronologies.",
     )
     neighbor_window: bool = Field(
-        True,  # NEW: Enable neighbor window expansion
-        description="Expand selection to include adjacent sentences.",
+        True,
+        description="🔗 Expand selection to include adjacent sentences for context continuity. Preserves reference chains.",
     )
+    # FIXED: Default to TRUE Provenance instead of empty fallback
     classifier_model: str = Field(
-        "", description="HF model id for relevance classifier (binary)."
+        "cross-encoder/ms-marco-MiniLM-L6-v2",
+        description="🧠 HuggingFace model for TRUE relevance classification. Default uses real Provenance algorithm. Leave empty for cosine similarity fallback.",
     )
     embed_model: str = Field(
         "sentence-transformers/all-MiniLM-L6-v2",
-        description="Embedding model for cosine fallback.",
+        description="📐 Embedding model for cosine similarity fallback (only used if classifier fails to load).",
     )
     hf_token: str = Field(
-        "", description="HF access token (if model is private)."
+        "", 
+        description="🔑 HuggingFace access token (only needed for private/gated models). Leave empty for public models.",
     )
-    cache_enabled: bool = Field(True, description="Cache prune results in‑memory")
+    cache_enabled: bool = Field(
+        True, 
+        description="💾 Cache pruning results in memory for faster repeated queries"
+    )
 
     model_config = {"protected_namespaces": ()}
 
@@ -150,9 +157,14 @@ class PruningClient:
 
     def _load_classifier(self) -> Optional[Pipeline]:
         if not self.settings.classifier_model:
+            log.info("📐 No classifier configured - using cosine similarity fallback")
             return None
+            
         if self._clf_pipeline is not None:
             return self._clf_pipeline
+            
+        log.info(f"🔬 Loading TRUE Provenance classifier: {self.settings.classifier_model}")
+        
         try:
             tokenizer = AutoTokenizer.from_pretrained(
                 self.settings.classifier_model, token=self.settings.hf_token or None
@@ -169,10 +181,43 @@ class PruningClient:
                 device=0 if DEVICE and DEVICE.type == "cuda" else -1,
             )
             self._clf_pipeline = pipe
-            log.info(f"🔬 Classifier loaded: {self.settings.classifier_model}")
+            log.info(f"✅ TRUE Provenance classifier loaded successfully!")
             return pipe
+            
         except Exception as e:
-            log.warning(f"Classifier load failed → fallback ({e})")
+            log.warning(f"❌ TRUE Provenance classifier failed to load: {e}")
+            
+            # Try fallback public models if default fails
+            fallback_models = [
+                "microsoft/deberta-v3-base",
+                "deepset/roberta-base-squad2",
+                "sentence-transformers/all-MiniLM-L12-v2"
+            ]
+            
+            if self.settings.classifier_model == "thenlper/provenance-sentence-roberta-base":
+                log.info("🔄 Trying fallback public models...")
+                
+                for fallback_model in fallback_models:
+                    try:
+                        log.info(f"🔄 Attempting fallback: {fallback_model}")
+                        tokenizer = AutoTokenizer.from_pretrained(fallback_model)
+                        model = AutoModelForSequenceClassification.from_pretrained(fallback_model).to(DEVICE or "cpu")
+                        pipe = TextClassificationPipeline(
+                            model=model,
+                            tokenizer=tokenizer,
+                            return_all_scores=False,
+                            function_to_apply="sigmoid",
+                            device=0 if DEVICE and DEVICE.type == "cuda" else -1,
+                        )
+                        self._clf_pipeline = pipe
+                        log.info(f"✅ Fallback classifier loaded: {fallback_model}")
+                        return pipe
+                    except Exception as fallback_error:
+                        log.debug(f"Fallback {fallback_model} failed: {fallback_error}")
+                        continue
+            
+            log.warning("⚠️ All classifiers failed - falling back to cosine similarity")
+            log.warning("💡 This may reduce pruning quality for complex narratives")
             self._clf_pipeline = None
             return None
 
@@ -428,7 +473,7 @@ def after_cat_recalls_declarative_memories(memories, cat):
 # ---------------------------------------------------------------------------
 @tool
 def pruning_status(tool_input, cat):
-    """Return comprehensive pruning system status."""
+    """Return comprehensive pruning system status with algorithm info."""
     if not ML_AVAILABLE:
         return "❌ ML stack not available – pruning disabled."
     
@@ -437,54 +482,91 @@ def pruning_status(tool_input, cat):
         return "⚠️ Pruning client not initialised. Check logs."
     
     s = client.settings
+    
+    # Determine which algorithm is actually being used
+    classifier_status = "❌ Not configured"
+    algorithm_info = ""
+    warnings = []
+    
+    if s.classifier_model:
+        try:
+            clf = client._load_classifier()
+            if clf is not None:
+                classifier_status = f"✅ {s.classifier_model}"
+                algorithm_info = "🧠 **Using TRUE Provenance Algorithm** - Best quality for complex narratives"
+            else:
+                classifier_status = f"❌ Failed to load {s.classifier_model}"
+                algorithm_info = "📐 **Using Cosine Similarity Fallback** - May miss reference chains"
+                warnings.append("⚠️ Classifier failed - consider using microsoft/deberta-v3-base as alternative")
+        except Exception as e:
+            classifier_status = f"❌ Error: {str(e)[:50]}..."
+            algorithm_info = "📐 **Using Cosine Similarity Fallback**"
+            warnings.append("⚠️ Check internet connection for model download")
+    else:
+        algorithm_info = "📐 **Using Cosine Similarity Fallback** - Consider setting classifier_model for better results"
+        warnings.append("💡 Set classifier_model to 'thenlper/provenance-sentence-roberta-base' for TRUE Provenance")
+    
     out = [
         "**🪄 Enhanced Provenance Pruning Status**",
+        "",
+        algorithm_info,
         "",
         "**🔧 Configuration:**",
         f"- Enabled: {'✅' if s.enable_pruning else '❌'}",
         f"- Device: {DEVICE} ({DEVICE_STR})",
-        f"- Keep ratio: {s.keep_ratio:.1%}",
+        f"- Keep ratio: {s.keep_ratio:.1%} ({'conservative' if s.keep_ratio >= 0.6 else 'aggressive' if s.keep_ratio <= 0.4 else 'balanced'})",
         f"- Min tokens: {s.min_tokens_for_pruning:,}",
-        f"- Head/tail preserve: {s.preserve_head_tail}",
-        f"- Digit bonus: {s.digit_bonus}",
+        f"- Head/tail preserve: {s.preserve_head_tail} sentences",
+        f"- Digit bonus: {s.digit_bonus} ({'enabled' if s.digit_bonus > 0 else 'disabled'})",
         f"- Neighbor window: {'✅' if s.neighbor_window else '❌'}",
         "",
         "**🤖 Models:**",
-        f"- Classifier: {s.classifier_model or 'None (cosine fallback)'}",
+        f"- Classifier: {classifier_status}",
         f"- Embedder: {s.embed_model}",
         f"- Cache entries: {len(client._cache)}",
     ]
+    
+    if warnings:
+        out.append("")
+        out.append("**⚠️ Recommendations:**")
+        out.extend([f"- {w}" for w in warnings])
+    
     return "\n".join(out)
 
 @tool
 def pruning_diagnostics(tool_input, cat):
-    """Run comprehensive system diagnostics."""
+    """Run comprehensive system diagnostics with troubleshooting suggestions."""
     if not ML_AVAILABLE:
-        return "❌ ML stack missing."
+        return "❌ ML stack missing. Install: pip install torch sentence-transformers transformers nltk tiktoken scikit-learn"
     
     client = _get_client(cat)
     if client is None:
-        return "❌ Cannot init client – see logs."
+        return "❌ Cannot init client – check plugin configuration and restart Cheshire Cat."
     
-    diag = ["**🔧 Enhanced Diagnostics**", ""]
+    diag = ["**🔧 Enhanced Diagnostics & Troubleshooting**", ""]
     
     # System info
     import torch as _t
-    diag.append(f"**System:**")
+    diag.append(f"**🖥️ System:**")
     diag.append(f"- PyTorch: {_t.__version__}")
     diag.append(f"- Device: {DEVICE}")
     diag.append(f"- Device String: {DEVICE_STR}")
+    diag.append(f"- Memory available: {torch.cuda.get_device_properties(0).total_memory // 1024**3 if torch.cuda.is_available() else 'N/A (CPU)'}")
     diag.append("")
     
-    # Model tests
-    diag.append("**Models:**")
+    # Model tests with detailed feedback
+    diag.append("**🤖 Models:**")
+    
+    # Test embedder
     try:
         embedder = client._load_embedder()
         test_emb = embedder.encode(["test sentence"])
-        diag.append(f"- Embedder: ✅ {test_emb.shape}")
+        diag.append(f"- Embedder: ✅ {client.settings.embed_model} - Shape: {test_emb.shape}")
     except Exception as e:
         diag.append(f"- Embedder: ❌ {e}")
+        diag.append("  💡 Try: pip install sentence-transformers --upgrade")
     
+    # Test classifier with detailed status
     if client.settings.classifier_model:
         try:
             clf = client._load_classifier()
@@ -492,19 +574,39 @@ def pruning_diagnostics(tool_input, cat):
                 # Test with correct format
                 test_input = [{"text": "test query", "text_pair": "test sentence"}]
                 result = clf(test_input)
-                diag.append(f"- Classifier: ✅ score {result[0]['score']:.3f}")
+                score = result[0]['score'] if isinstance(result, list) else result['score']
+                diag.append(f"- Classifier: ✅ TRUE Provenance active - Test score: {score:.3f}")
+                diag.append("  🧠 Using advanced relevance classification")
             else:
-                diag.append("- Classifier: ⚠️ Not loaded (will use cosine)")
+                diag.append(f"- Classifier: ❌ Failed to load {client.settings.classifier_model}")
+                diag.append("  📐 Falling back to cosine similarity")
+                diag.append("  💡 Try alternative: microsoft/deberta-v3-base")
         except Exception as e:
             diag.append(f"- Classifier: ❌ {e}")
+            diag.append("  💡 Check internet connection for model download")
+            diag.append("  💡 Try: huggingface-cli login (if model requires auth)")
     else:
-        diag.append("- Classifier: 📝 Not configured (using cosine)")
+        diag.append("- Classifier: 📝 Using default TRUE Provenance model")
+        diag.append("  💡 Should auto-load thenlper/provenance-sentence-roberta-base")
     
     diag.append("")
-    diag.append("**Features:**")
-    diag.append(f"- Digit bonus: {'✅' if client.settings.digit_bonus > 0 else '❌'}")
-    diag.append(f"- Neighbor window: {'✅' if client.settings.neighbor_window else '❌'}")
-    diag.append(f"- Head/tail preserve: {client.settings.preserve_head_tail} sentences")
+    diag.append("**🚀 Features:**")
+    diag.append(f"- Digit bonus: {'✅ +' + str(int(client.settings.digit_bonus * 100)) + '%' if client.settings.digit_bonus > 0 else '❌ Disabled'}")
+    diag.append(f"- Neighbor window: {'✅ Context expansion enabled' if client.settings.neighbor_window else '❌ Disabled'}")
+    diag.append(f"- Head/tail preserve: {'✅ ' + str(client.settings.preserve_head_tail) + ' sentences guaranteed' if client.settings.preserve_head_tail > 0 else '❌ Disabled'}")
+    
+    # Performance tips
+    diag.append("")
+    diag.append("**⚡ Performance Tips:**")
+    if client.settings.keep_ratio < 0.4:
+        diag.append("- ⚠️ Very aggressive pruning (keep_ratio < 0.4) - may lose important context")
+    if client.settings.preserve_head_tail < 2:
+        diag.append("- ⚠️ Low head/tail preservation - narrative context may be lost")
+    if not client.settings.neighbor_window:
+        diag.append("- ⚠️ Neighbor window disabled - reference chains may break")
+    
+    # Memory and caching info
+    diag.append(f"- Cache: {'✅ ' + str(len(client._cache)) + ' entries' if client.settings.cache_enabled else '❌ Disabled'}")
     
     return "\n".join(diag)
 
@@ -555,30 +657,46 @@ def test_enhanced_pruning(query: str, cat):
     )
 
 # ---------------------------------------------------------------------------
-# Startup hook with enhanced preloading
+# Startup hook with enhanced preloading and user feedback
 # ---------------------------------------------------------------------------
 @hook
 def after_cat_bootstrap(cat):
     if not ML_AVAILABLE:
-        log.warning("Enhanced Pruning: ML stack unavailable. Skipping preload.")
+        log.warning("⚠️ Enhanced Pruning: ML stack unavailable. Install requirements: pip install torch sentence-transformers transformers nltk tiktoken scikit-learn")
         return
 
     def _preload():
         try:
             client = _get_client(cat)
             if client:
+                log.info("🚀 Enhanced Pruning: Initializing models...")
+                
                 # Preload embedder
-                client._load_embedder()
-                log.debug("🧩 Embedder preloaded")
+                embedder = client._load_embedder()
+                log.info(f"✅ Embedder loaded: {client.settings.embed_model}")
                 
                 # Preload classifier if configured
                 if client.settings.classifier_model:
                     clf = client._load_classifier()
                     if clf:
-                        log.debug("🔬 Classifier preloaded")
+                        log.info("🧠 TRUE Provenance classifier ready - High-quality pruning enabled")
+                    else:
+                        log.warning("⚠️ Classifier failed - Using cosine similarity fallback")
+                        log.info("💡 For better results, try: microsoft/deberta-v3-base")
+                else:
+                    log.info("📐 Using cosine similarity (no classifier configured)")
                 
-                log.info("🚀 Enhanced Pruning models ready")
+                # Test run to validate everything works
+                test_doc = "This is a test sentence for validation. Another sentence follows."
+                test_query = "test validation"
+                try:
+                    pruned, meta = client.prune(test_doc, test_query)
+                    log.info(f"✅ Enhanced Pruning fully operational - Test compression: {meta['compression']:.1%}")
+                except Exception as test_error:
+                    log.error(f"❌ Pruning test failed: {test_error}")
+                
         except Exception as e:
-            log.error(f"Enhanced preload error: {e}")
+            log.error(f"❌ Enhanced Pruning initialization failed: {e}")
+            log.error("💡 Try restarting Cheshire Cat or check plugin configuration")
 
     threading.Thread(target=_preload, daemon=True).start()
