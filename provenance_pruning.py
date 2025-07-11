@@ -96,7 +96,7 @@ class ProvenanceSettings(BaseModel):
         description="🔒 Sentences GUARANTEED preserved from document start & end. Essential for narrative context.",
     )
     digit_bonus: float = Field(
-        0.25,
+        0.45,
         ge=0.0,
         le=1.0,
         description="🔢 Score bonus for sentences with numbers/dates/quantities (0.25 = +25% score). Great for chronologies.",
@@ -176,7 +176,7 @@ class PruningClient:
             pipe = TextClassificationPipeline(
                 model=model,
                 tokenizer=tokenizer,
-                return_all_scores=False,
+                top_k=1,
                 function_to_apply="sigmoid",
                 device=0 if DEVICE and DEVICE.type == "cuda" else -1,
             )
@@ -205,7 +205,7 @@ class PruningClient:
                         pipe = TextClassificationPipeline(
                             model=model,
                             tokenizer=tokenizer,
-                            return_all_scores=False,
+                            top_k=1,
                             function_to_apply="sigmoid",
                             device=0 if DEVICE and DEVICE.type == "cuda" else -1,
                         )
