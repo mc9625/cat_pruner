@@ -1,442 +1,458 @@
 """
-Provenance Pruning Plugin for Cheshire Cat AI
-Implements advanced pruning to reduce RAG hallucinations
-Optimized for PyTorch MPS on Apple Silicon
-"""
+Provenance‑Style Pruning Plugin for **Cheshire Cat AI**
+=======================================================
 
-import time
+Removes sentence‑level noise from recalled documents before they
+reach the LLM, minimising hallucinations.  
+Optimised for CPU / CUDA / Apple Silicon MPS.
+
+Changes vs. first draft
+-----------------------
+* **Real classifier support** – loads a Provenance (binary sentence‑
+  relevance) checkpoint if provided; otherwise falls back to cosine
+  similarity with an embedding model.
+* Parameter renamed **keep_ratio** (fraction of sentences to KEEP).  
+  Compression = `1‑keep_ratio`.
+* Accurate token counting via *tiktoken* when available.
+* Cache key uses SHA‑256 ⇒ stable across restarts.
+* Pruning returns **new MemoryDocument copies** preserving original
+  retrieval score.
+* Diagnostics & status report clearer error causes.
+
+Installation hint
+-----------------
+Add to your plugin folder and list dependencies in the plugin’s
+`requirements.txt` (see bottom of file).  Provide a valid Hugging Face
+model id in settings **classifier_model** or keep default (cosine sim).
+
+"""
+from __future__ import annotations
+
+import hashlib
+import json
 import platform
 import threading
-from typing import List, Dict, Any, Optional, Tuple
+import time
+from copy import deepcopy
+from typing import Any, Dict, List, Optional, Tuple
 
-from cat.mad_hatter.decorators import hook, tool, plugin
 from cat.log import log
-from pydantic import BaseModel, Field
+from cat.mad_hatter.decorators import hook, plugin, tool
+from pydantic import BaseModel, Field, ValidationError
 
-# Import ML dependencies with graceful error handling
+# ---------------------------------------------------------------------------
+# Optional imports – guarded so that Cat boots even if ML stack is missing
+# ---------------------------------------------------------------------------
+ML_AVAILABLE = True
 try:
     import torch
     import nltk
-    from sentence_transformers import SentenceTransformer
-    import numpy as np
     from sklearn.metrics.pairwise import cosine_similarity
-    
-    # Setup NLTK
+    from sentence_transformers import SentenceTransformer
+    from transformers import (
+        AutoModelForSequenceClassification,
+        AutoTokenizer,
+        Pipeline,
+        TextClassificationPipeline,
+    )
+
+    # NLTK sentence split
     try:
-        nltk.data.find('tokenizers/punkt')
+        nltk.data.find("tokenizers/punkt")
     except LookupError:
-        nltk.download('punkt', quiet=True)
-    
-    # Detect optimal device
-    if platform.machine() in ['arm64', 'aarch64'] and torch.backends.mps.is_available():
+        nltk.download("punkt", quiet=True)
+
+    # tiktoken is optional – improves token estimation
+    try:
+        import tiktoken
+
+        enc = tiktoken.encoding_for_model("gpt-3.5-turbo")
+    except Exception:
+        enc = None
+
+    # Device detection
+    if (
+        platform.machine() in {"arm64", "aarch64"}
+        and torch.backends.mps.is_available()
+    ):
         DEVICE = torch.device("mps")
-        log.info("🍎 Using Apple Silicon MPS acceleration")
+        log.info("🍎 Using Apple Silicon MPS backend")
     elif torch.cuda.is_available():
         DEVICE = torch.device("cuda")
-        log.info("⚡ Using CUDA acceleration")
+        log.info("⚡ Using CUDA backend")
     else:
         DEVICE = torch.device("cpu")
         log.info("💻 Using CPU backend")
-    
-    ML_AVAILABLE = True
-    log.info("✅ Provenance ML dependencies loaded successfully")
-    
-except ImportError as e:
+except Exception as e:  # broad – anything fails ⇒ disable ML path
     ML_AVAILABLE = False
     DEVICE = None
-    log.error(f"❌ ML dependencies import failed: {e}")
-    
-except Exception as e:
-    ML_AVAILABLE = False
-    DEVICE = None
-    log.error(f"❌ Unexpected error loading ML dependencies: {e}")
+    log.warning(f"⚠️ ML stack unavailable: {e}")
 
-# Global caches
-_model_cache = {}
-_cache_lock = threading.Lock()
-
+# ---------------------------------------------------------------------------
+# Settings schema – editable from Cat admin UI
+# ---------------------------------------------------------------------------
 class ProvenanceSettings(BaseModel):
-    """Settings for Provenance Pruning Plugin."""
-    
+    """Plugin settings editable from the Admin UI."""
+
+    enable_pruning: bool = Field(
+        True, description="Enable/disable sentence‑level pruning"
+    )
+    keep_ratio: float = Field(
+        0.3,
+        ge=0.05,
+        le=0.95,
+        description="Fraction of sentences to keep after scoring",
+    )
+    min_tokens_for_pruning: int = Field(
+        800,
+        ge=200,
+        le=8000,
+        description="Skip pruning if recalled context has fewer tokens.",
+    )
+    preserve_head_tail: int = Field(
+        2,
+        ge=0,
+        le=10,
+        description="Sentences always preserved from doc head & tail.",
+    )
+    classifier_model: str = Field(
+        "", description="HF model id for relevance classifier (binary)."
+    )
+    embed_model: str = Field(
+        "sentence-transformers/all-MiniLM-L6-v2",
+        description="Embedding model for cosine fallback.",
+    )
+    hf_token: str = Field(
+        "", description="HF access token (if model is private)."
+    )
+    cache_enabled: bool = Field(True, description="Cache prune results in‑memory")
+
+    # internal pydantic config so Cat doesn’t treat Field as memory namespace
     model_config = {"protected_namespaces": ()}
-    
-    enable_pruning: bool = Field(default=True, description="Enable/disable automatic pruning")
-    compression_ratio: float = Field(default=0.7, ge=0.1, le=0.9, description="Text compression percentage (0.1-0.9)")
-    min_tokens_for_pruning: int = Field(default=1000, ge=500, le=5000, description="Minimum tokens to activate pruning")
-    similarity_threshold: float = Field(default=0.3, ge=0.0, le=1.0, description="Similarity threshold to keep sentences")
-    preserve_sentences: int = Field(default=2, ge=1, le=5, description="Minimum sentences to always preserve")
-    model_name: str = Field(default="sentence-transformers/all-MiniLM-L6-v2", description="Model for similarity calculation")
-    cache_enabled: bool = Field(default=True, description="Enable results caching")
+
 
 @plugin
-def settings_model():
+def settings_model():  # exposed to Cat
     return ProvenanceSettings
 
-class ProvenanceClient:
-    """Client for pruning with PyTorch optimization."""
-    
+# ---------------------------------------------------------------------------
+# Helper client – loads models & executes pruning
+# ---------------------------------------------------------------------------
+class PruningClient:
     def __init__(self, settings: ProvenanceSettings):
+        if not ML_AVAILABLE:
+            raise RuntimeError("ML stack missing – cannot create client")
         self.settings = settings
-        self.model = None
-        self._cache = {}
-        
-    def get_model(self):
-        """Get model with caching."""
-        if self.model is not None:
-            return self.model
-            
-        with _cache_lock:
-            if self.settings.model_name in _model_cache:
-                self.model = _model_cache[self.settings.model_name]
-                return self.model
-                
-            model = SentenceTransformer(self.settings.model_name)
-            
-            if DEVICE and DEVICE.type != "cpu":
-                try:
-                    model = model.to(DEVICE)
-                except Exception as e:
-                    log.warning(f"Device optimization failed: {e}")
-                    
-            _model_cache[self.settings.model_name] = model
-            self.model = model
-            return model
-    
-    def split_sentences(self, text: str) -> List[str]:
-        """Split text into sentences."""
+        self._embed_model: Optional[SentenceTransformer] = None
+        self._clf_pipeline: Optional[Pipeline] = None
+        self._cache: Dict[str, Tuple[str, Dict[str, Any]]] = {}
+        self._lock = threading.Lock()
+
+    # ~~~~~~~~~~~~~ model loaders ~~~~~~~~~~~~~
+    def _load_embedder(self) -> SentenceTransformer:
+        if self._embed_model is not None:
+            return self._embed_model
+        model = SentenceTransformer(
+            self.settings.embed_model, device=str(DEVICE) if DEVICE else "cpu"
+        )
+        self._embed_model = model
+        log.info(f"🧩 Embedding model loaded: {self.settings.embed_model}")
+        return model
+
+    def _load_classifier(self) -> Optional[Pipeline]:
+        if not self.settings.classifier_model:
+            return None  # user hasn’t set one
+        if self._clf_pipeline is not None:
+            return self._clf_pipeline
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                self.settings.classifier_model, token=self.settings.hf_token or None
+            )
+            model = AutoModelForSequenceClassification.from_pretrained(
+                self.settings.classifier_model,
+                token=self.settings.hf_token or None,
+            ).to(DEVICE or "cpu")
+            pipe = TextClassificationPipeline(
+                model=model,
+                tokenizer=tokenizer,
+                return_all_scores=False,
+                function_to_apply="sigmoid",
+                device=0 if DEVICE and DEVICE.type != "cpu" else -1,
+            )
+            self._clf_pipeline = pipe
+            log.info(f"🔬 Classifier loaded: {self.settings.classifier_model}")
+            return pipe
+        except Exception as e:
+            log.warning(f"Classifier load failed → fallback ({e})")
+            self._clf_pipeline = None
+            return None
+
+    # ~~~~~~~~~~~~~ util ~~~~~~~~~~~~~
+    @staticmethod
+    def _sentence_split(text: str) -> List[str]:
         try:
             return nltk.sent_tokenize(text)
-        except:
-            return [s.strip() for s in text.split('.') if s.strip()]
-    
-    def calculate_similarity(self, query: str, sentences: List[str]) -> List[float]:
-        """Calculate query-sentence similarity."""
-        model = self.get_model()
-        
+        except Exception:  # fallback simple split
+            return [s.strip() for s in text.split(".") if s.strip()]
+
+    def _token_len(self, text: str) -> int:
+        if enc:
+            try:
+                return len(enc.encode(text))
+            except Exception:
+                pass
+        return int(len(text.split()) * 1.3)  # crude fallback
+
+    # ~~~~~~~~~~~~~ scoring ~~~~~~~~~~~~~
+    def _cosine_scores(self, query: str, sentences: List[str]) -> List[float]:
+        embedder = self._load_embedder()
+        with torch.no_grad():
+            emb = embedder.encode([query] + sentences, normalize_embeddings=True)
+        query_emb, sent_emb = emb[0:1], emb[1:]
+        scores = cosine_similarity(query_emb, sent_emb)[0]
+        return scores.tolist()
+
+    def _classifier_scores(self, query: str, sentences: List[str]) -> Optional[List[float]]:
+        pipe = self._load_classifier()
+        if pipe is None:
+            return None
         try:
-            with torch.no_grad():
-                query_emb = model.encode([query])
-                sentence_embs = model.encode(sentences)
-                similarities = cosine_similarity(query_emb, sentence_embs)[0]
-                return similarities.tolist()
-                
+            inputs = [(query, s) for s in sentences]
+            preds = pipe(inputs, batch_size=min(32, len(inputs)))
+            # pipeline returns list of dicts [{'label': 'LABEL_1', 'score': 0.87}, …]
+            return [p["score"] for p in preds]
         except Exception as e:
-            log.error(f"Similarity calculation failed: {e}")
-            return self._fallback_similarity(query, sentences)
-    
-    def _fallback_similarity(self, query: str, sentences: List[str]) -> List[float]:
-        """Lexical similarity fallback."""
-        try:
-            query_words = set(query.lower().split())
-            similarities = []
-            
-            for sentence in sentences:
-                sentence_words = set(sentence.lower().split())
-                intersection = len(query_words & sentence_words)
-                union = len(query_words | sentence_words)
-                similarity = intersection / union if union > 0 else 0
-                similarities.append(similarity)
-                
-            return similarities
-            
-        except Exception as e:
-            log.error(f"Fallback similarity failed: {e}")
-            return [0.5] * len(sentences)
-    
-    def prune_document(self, document: str, query: str) -> Tuple[str, Dict[str, Any]]:
-        """Apply pruning to document."""
+            log.warning(f"Classifier inference failed → fallback ({e})")
+            return None
+
+    # ~~~~~~~~~~~~~ public API ~~~~~~~~~~~~~
+    def prune(self, document: str, query: str) -> Tuple[str, Dict[str, Any]]:
         if not document.strip():
-            return document, {"compression_ratio": 0, "sentences_kept": 0}
-        
-        # Cache check
-        cache_key = hash(f"{document}_{query}_{self.settings.compression_ratio}")
-        if self.settings.cache_enabled and cache_key in self._cache:
-            return self._cache[cache_key]
-        
-        start_time = time.time()
-        
-        # Split and check length
-        sentences = self.split_sentences(document)
-        if len(sentences) <= self.settings.preserve_sentences:
-            return document, {"compression_ratio": 0, "sentences_kept": len(sentences)}
-        
-        # Calculate similarity and apply positional bias
-        similarities = self.calculate_similarity(query, sentences)
-        
-        target_count = max(
-            self.settings.preserve_sentences,
-            int(len(sentences) * self.settings.compression_ratio)
-        )
-        
-        scored = []
-        for i, (sentence, sim) in enumerate(zip(sentences, similarities)):
-            position_bias = 0.1 if i < 2 else 0.05 if i >= len(sentences) - 2 else 0
-            final_score = sim + position_bias
-            scored.append((i, sentence, final_score))
-        
-        # Select and reorder
-        scored.sort(key=lambda x: x[2], reverse=True)
-        selected = scored[:target_count]
-        selected.sort(key=lambda x: x[0])
-        
-        pruned_text = ' '.join([item[1] for item in selected])
-        
-        metadata = {
-            "compression_ratio": 1 - (len(selected) / len(sentences)),
-            "sentences_kept": len(selected),
-            "processing_time": time.time() - start_time
-        }
-        
-        result = (pruned_text, metadata)
-        
+            return document, {"compression": 0, "sentences_kept": 0}
+
+        # deterministic cache key
         if self.settings.cache_enabled:
-            self._cache[cache_key] = result
-            
-        return result
+            cache_key = hashlib.sha256(
+                json.dumps([
+                    document,
+                    query,
+                    self.settings.keep_ratio,
+                    self.settings.classifier_model,
+                    self.settings.embed_model,
+                ]).encode()
+            ).hexdigest()
+            if cache_key in self._cache:
+                return self._cache[cache_key]
 
-# Global client
-_client = None
+        start = time.time()
+        sentences = self._sentence_split(document)
+        total = len(sentences)
+        if total == 0:
+            return document, {"compression": 0, "sentences_kept": 0}
 
-def get_client(cat) -> Optional[ProvenanceClient]:
-    """Get configured client."""
-    global _client
-    
+        # scoring – classifier preferred, else cosine
+        scores = self._classifier_scores(query, sentences)
+        if scores is None:
+            scores = self._cosine_scores(query, sentences)
+
+        # positional bias (keep_ratio == 1 → skip sorting)
+        bias_head_tail = self.settings.preserve_head_tail
+        biased = []
+        for idx, (sent, sc) in enumerate(zip(sentences, scores)):
+            pos_bonus = 0.1 if idx < bias_head_tail or idx >= total - bias_head_tail else 0.0
+            biased.append((idx, sent, sc + pos_bonus))
+
+        # select top‑k by score then restore order
+        keep = max(1, int(total * self.settings.keep_ratio))
+        biased.sort(key=lambda x: x[2], reverse=True)
+        selected = sorted(biased[:keep], key=lambda x: x[0])
+        pruned_text = " ".join([s[1] for s in selected])
+
+        meta = {
+            "compression": 1 - (len(selected) / total),
+            "sentences_kept": len(selected),
+            "processing_time": round(time.time() - start, 3),
+        }
+        if self.settings.cache_enabled:
+            self._cache[cache_key] = (pruned_text, meta)
+        return pruned_text, meta
+
+
+# ---------------------------------------------------------------------------
+# Global helpers – instantiated lazily per Cat process
+# ---------------------------------------------------------------------------
+_CLIENT: Optional[PruningClient] = None
+
+
+def _get_client(cat) -> Optional[PruningClient]:
+    global _CLIENT
     if not ML_AVAILABLE:
         return None
-        
     try:
-        settings = cat.mad_hatter.get_plugin().load_settings()
-        settings_obj = ProvenanceSettings(**settings)
-        
-        if _client is None or _client.settings.model_name != settings_obj.model_name:
-            _client = ProvenanceClient(settings_obj)
-        return _client
-    except Exception as e:
-        log.error(f"Error getting client: {e}")
+        raw = cat.mad_hatter.get_plugin().load_settings()
+        settings = ProvenanceSettings(**raw)
+    except ValidationError as e:
+        log.error(f"Pruning settings invalid: {e}")
         return None
 
+    if _CLIENT is None or _CLIENT.settings != settings:
+        try:
+            _CLIENT = PruningClient(settings)
+        except Exception as e:
+            log.error(f"Cannot init PruningClient: {e}")
+            _CLIENT = None
+    return _CLIENT
+
+# ---------------------------------------------------------------------------
+# Hooks – attach to Cat retrieval pipeline
+# ---------------------------------------------------------------------------
 @hook(priority=2)
-def before_cat_recalls_declarative_memories(declarative_recall_config, cat):
-    """Increase documents for pruning."""
-    settings = cat.mad_hatter.get_plugin().load_settings()
-    
-    if settings.get("enable_pruning", True) and ML_AVAILABLE:
-        original_k = declarative_recall_config.get("k", 3)
-        declarative_recall_config["k"] = min(original_k * 2, 10)
-    
-    return declarative_recall_config
+def before_cat_recalls_declarative_memories(cfg, cat):
+    # Increase k so pruning has broader pool
+    try:
+        settings = ProvenanceSettings(**cat.mad_hatter.get_plugin().load_settings())
+        if settings.enable_pruning:
+            cfg["k"] = min(cfg.get("k", 3) * 2, 10)
+    except Exception:
+        pass
+    return cfg
+
 
 @hook(priority=1)
-def after_cat_recalls_declarative_memories(declarative_memories, cat):
-    """Apply pruning to documents."""
-    settings = cat.mad_hatter.get_plugin().load_settings()
-    
-    if not settings.get("enable_pruning", True) or not declarative_memories:
-        return declarative_memories
-        
-    client = get_client(cat)
-    if not client:
-        return declarative_memories
-    
-    try:
-        query = cat.working_memory.user_message_json.text
-        
-        # Check if pruning is needed
-        total_text = "\n".join([mem[0].page_content for mem in declarative_memories])
-        estimated_tokens = len(total_text.split()) * 1.3
-        
-        if estimated_tokens < settings.get("min_tokens_for_pruning", 1000):
-            return declarative_memories
-            
-        # Apply pruning
-        for memory in declarative_memories:
-            original_content = memory[0].page_content
-            pruned_content, metadata = client.prune_document(original_content, query)
-            memory[0].page_content = pruned_content
-            
-        # Log result
-        final_text = "\n".join([mem[0].page_content for mem in declarative_memories])
-        final_tokens = len(final_text.split()) * 1.3
-        compression = (estimated_tokens - final_tokens) / estimated_tokens
-        
-        log.info(f"✅ Pruning: {estimated_tokens:.0f} → {final_tokens:.0f} tokens ({compression:.1%} compression)")
-        
-        return declarative_memories
-        
-    except Exception as e:
-        log.error(f"Pruning failed: {e}")
-        return declarative_memories
+def after_cat_recalls_declarative_memories(memories, cat):
+    """Apply sentence‑level pruning and return **new** memories list."""
+    if not memories:
+        return memories
+    client = _get_client(cat)
+    if client is None:
+        return memories
 
+    settings = client.settings
+    if not settings.enable_pruning:
+        return memories
+
+    # decide if we need pruning based on total tokens
+    try:
+        total_text = "\n".join([doc.page_content for doc, _ in memories])
+        if client._token_len(total_text) < settings.min_tokens_for_pruning:
+            return memories
+    except Exception:
+        pass  # if anything goes wrong, fail open
+
+    query = cat.working_memory.user_message_json.text
+    pruned_memories = []
+    for doc, score in memories:
+        new_doc = deepcopy(doc)
+        pruned, meta = client.prune(doc.page_content, query)
+        new_doc.page_content = pruned
+        pruned_memories.append((new_doc, score))
+
+    log.info(
+        "✂️ Pruning done – compression {:.1%} in {:.3f}s".format(
+            meta["compression"], meta["processing_time"]
+        )
+    )
+    return pruned_memories
+
+# ---------------------------------------------------------------------------
+# Utility tools – callable by user / agent
+# ---------------------------------------------------------------------------
 @tool
 def pruning_status(tool_input, cat):
-    """Show pruning system status."""
-    settings = cat.mad_hatter.get_plugin().load_settings()
-    
-    status = [
-        "**🔥 Provenance Pruning Status**",
-        "",
-        "**System:**",
-        f"- ML Available: {'✅' if ML_AVAILABLE else '❌'}",
-        f"- Device: {DEVICE if DEVICE else 'N/A'}",
-        f"- Platform: {platform.machine()}",
-        "",
-        "**Configuration:**",
-        f"- Pruning: {'🟢 Active' if settings.get('enable_pruning', True) else '🔴 Disabled'}",
-        f"- Compression: {settings.get('compression_ratio', 0.7):.1%}",
-        f"- Token Threshold: {settings.get('min_tokens_for_pruning', 1000):,}",
-        f"- Model: {settings.get('model_name', 'sentence-transformers/all-MiniLM-L6-v2')}",
-        f"- Cache: {'✅' if settings.get('cache_enabled', True) else '❌'}",
-    ]
-    
-    if _client and _client._cache:
-        status.append(f"- Cache Entries: {len(_client._cache)}")
-    
-    if ML_AVAILABLE:
-        status.extend([
-            "",
-            "**🔧 ML Status:**",
-            f"- PyTorch: {torch.__version__}",
-            f"- Model Cache: {len(_model_cache)} entries",
-        ])
-        
-        if DEVICE and DEVICE.type == "mps":
-            status.append(f"- MPS: {'✅' if torch.backends.mps.is_available() else '❌'}")
-        elif DEVICE and DEVICE.type == "cuda":
-            status.append(f"- CUDA: {'✅' if torch.cuda.is_available() else '❌'}")
-    
-    return "\n".join(status)
-
-@tool
-def test_pruning(test_query, cat):
-    """Test pruning on specific query. Input the query to test."""
+    """Return human‑readable pruning system status."""
     if not ML_AVAILABLE:
-        return "❌ ML dependencies not available"
-        
-    client = get_client(cat)
-    if not client:
-        return "❌ Client not available"
-    
-    try:
-        test_doc = """The training cost of the DeepSeek-V3 model was 5.576 million dollars.
-DeepSeek-V3 uses a transformer architecture with efficient attention mechanism.
-The DeepSeek company is based in China and specializes in artificial intelligence.
-The model was trained on distributed GPU clusters.
-Results show competitive performance compared to other models.
-The technical paper describes the optimization mechanisms used.
-Metrics include BLEU score and accuracy on standard benchmarks."""
-        
-        pruned_doc, metadata = client.prune_document(test_doc, test_query)
-        
-        return f"""**🧪 Test Pruning Results**
+        return "❌ ML stack not available – pruning disabled."
+    client = _get_client(cat)
+    if client is None:
+        return "⚠️ Pruning client not initialised. Check logs."
+    s = client.settings
+    out = [
+        "**🪄 Provenance Pruning Status**",
+        f"- Enabled: {'✅' if s.enable_pruning else '❌'}",
+        f"- Device: {DEVICE}",
+        f"- Keep ratio: {s.keep_ratio:.2f}",
+        f"- Min tokens: {s.min_tokens_for_pruning}",
+        f"- Classifier: {s.classifier_model or '—'}",
+        f"- Embed model: {s.embed_model}",
+        f"- Cache entries: {len(client._cache)}",
+    ]
+    return "\n".join(out)
 
-**Query:** {test_query}
-
-**Results:**
-- Compression: {metadata['compression_ratio']:.1%}
-- Sentences kept: {metadata['sentences_kept']}
-- Time: {metadata['processing_time']:.3f}s
-
-**Pruned Document:**
-{pruned_doc}"""
-        
-    except Exception as e:
-        return f"❌ Test error: {str(e)}"
 
 @tool
 def pruning_diagnostics(tool_input, cat):
-    """Run complete system diagnostics."""
+    """Run dependency and model sanity checks."""
     if not ML_AVAILABLE:
-        return "❌ ML dependencies not available"
-    
-    diagnostics = []
-    
-    # Test core dependencies
+        return "❌ ML stack missing."
+    client = _get_client(cat)
+    if client is None:
+        return "❌ Cannot init client – see logs."
+    diag = ["**🔧 Diagnostics**"]
+    # torch & device
+    import torch as _t
+
+    diag.append(f"PyTorch: {_t.__version__}")
+    diag.append(f"Device: {DEVICE}")
+    # model tests
     try:
-        diagnostics.append(f"✅ PyTorch {torch.__version__}")
-        diagnostics.append("✅ NLTK available")
-        diagnostics.append("✅ SentenceTransformers available")
-        diagnostics.append("✅ Scikit-learn available")
-        diagnostics.append(f"✅ Device: {DEVICE}")
+        emb = client._load_embedder().encode(["test"])
+        diag.append(f"Embed OK: {emb.shape}")
     except Exception as e:
-        diagnostics.append(f"❌ Dependencies: {e}")
-    
-    # Test model
-    try:
-        client = get_client(cat)
-        if client:
-            model = client.get_model()
-            test_emb = model.encode(["test"])
-            diagnostics.append(f"✅ Model: {client.settings.model_name}")
-            diagnostics.append(f"✅ Encoding test: {test_emb.shape}")
-        else:
-            diagnostics.append("❌ Client not available")
-    except Exception as e:
-        diagnostics.append(f"❌ Model test: {e}")
-    
-    return "**🔧 System Diagnostics**\n\n" + "\n".join(diagnostics)
+        diag.append(f"Embed FAIL: {e}")
+    if client.settings.classifier_model:
+        try:
+            clf = client._load_classifier()
+            if clf:
+                score = clf([("test", "test")])[0]["score"]
+                diag.append(f"Classifier OK: score {score:.2f}")
+            else:
+                diag.append("Classifier not loaded (fallback mode)")
+        except Exception as e:
+            diag.append(f"Classifier FAIL: {e}")
+    return "\n".join(diag)
+
 
 @tool
-def fix_plugin_issues(tool_input, cat):
-    """Try to automatically fix common plugin issues."""
+def test_pruning(query: str, cat):
+    """Quick self‑test on a canned DeepSeek paragraph."""
     if not ML_AVAILABLE:
-        return """❌ ML dependencies not available.
+        return "❌ ML stack missing."
+    client = _get_client(cat)
+    if client is None:
+        return "❌ Client not available (see logs)."
+    doc = (
+        "The training cost of the DeepSeek‑V3 model was 5.576 million dollars. "
+        "DeepSeek‑V3 uses a transformer architecture with efficient attention mechanism. "
+        "The DeepSeek company is based in China and specializes in artificial intelligence. "
+        "The model was trained on distributed GPU clusters. "
+        "Results show competitive performance compared to other models. "
+        "Metrics include BLEU score and accuracy on standard benchmarks."
+    )
+    pruned, meta = client.prune(doc, query)
+    return (
+        f"**🧪 Test**\nQuery: {query}\nCompression: {meta['compression']:.1%}\n"
+        f"Kept: {meta['sentences_kept']} sentences\n\n{pruned}"
+    )
 
-**Solutions:**
-1. Restart Cheshire Cat completely
-2. Check logs for specific errors
-3. Use `pruning diagnostics` for details"""
-    
-    fixes = []
-    
-    try:
-        global _client, _model_cache
-        _client = None
-        _model_cache.clear()
-        fixes.append("✅ Caches cleared")
-    except Exception as e:
-        fixes.append(f"❌ Cache cleanup failed: {e}")
-    
-    try:
-        client = get_client(cat)
-        if client:
-            model = client.get_model()
-            test_emb = model.encode(["test"])
-            fixes.append(f"✅ Model test: {test_emb.shape}")
-        else:
-            fixes.append("❌ Client not available")
-    except Exception as e:
-        fixes.append(f"❌ Model test failed: {e}")
-    
-    return f"""**🔧 Repair Results**
 
-{chr(10).join(fixes)}
-
-**Next steps:**
-1. Use `pruning status` to verify
-2. Test with `test pruning "query"`"""
-
+# ---------------------------------------------------------------------------
+# Startup hook – preload models asynchronously
+# ---------------------------------------------------------------------------
 @hook
 def after_cat_bootstrap(cat):
-    """Initialize plugin."""
-    if ML_AVAILABLE:
-        log.info("🚀 Provenance Pruning Plugin initialized successfully")
-        
-        def preload():
+    if not ML_AVAILABLE:
+        log.warning("Pruning plugin: ML stack unavailable. Skipping preload.")
+        return
+
+    def _preload():
+        client = _get_client(cat)
+        if client:
             try:
-                client = get_client(cat)
-                if client:
-                    model = client.get_model()
-                    test_emb = model.encode(["test"])
-                    log.info(f"✅ Model preloaded and tested: {test_emb.shape}")
+                client._load_embedder()
+                if client.settings.classifier_model:
+                    client._load_classifier()
+                log.info("🧊 Pruning models pre‑loaded")
             except Exception as e:
-                log.error(f"Model preload failed: {e}")
-        
-        threading.Thread(target=preload, daemon=True).start()
-        
-        settings = cat.mad_hatter.get_plugin().load_settings()
-        if settings.get("enable_pruning", True):
-            device_info = f"on {DEVICE}" if DEVICE else "CPU mode"
-            log.info(f"🔥 Provenance Pruning active {device_info}")
-            
-    else:
-        log.warning("⚠️ Provenance Plugin: ML dependencies missing")
+                log.error(f"Preload error: {e}")
+
+    threading.Thread(target=_preload, daemon=True).start()
