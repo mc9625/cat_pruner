@@ -1,5 +1,6 @@
 """
-Provenance‑Style Pruning Plugin for **Cheshire Cat AI** 
+Provenance-Style Pruning Plugin for Cheshire Cat AI
+Implements intelligent sentence-level document pruning based on query relevance.
 """
 from __future__ import annotations
 
@@ -9,16 +10,15 @@ import platform
 import re
 import threading
 import time
+from collections import OrderedDict
 from copy import deepcopy
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from cat.log import log
 from cat.mad_hatter.decorators import hook, plugin, tool
 from pydantic import BaseModel, Field, ValidationError
 
-# ---------------------------------------------------------------------------
-# Optional imports – guarded so that Cat boots even if ML stack is missing
-# ---------------------------------------------------------------------------
+# ML imports with graceful fallback
 ML_AVAILABLE = True
 try:
     import torch
@@ -26,102 +26,101 @@ try:
     from sklearn.metrics.pairwise import cosine_similarity
     from sentence_transformers import SentenceTransformer
     from transformers import (
-        AutoModel, # <-- AGGIUNTA QUESTA RIGA
+        AutoModel,
         AutoModelForSequenceClassification,
         AutoTokenizer,
-        Pipeline,
         TextClassificationPipeline,
     )
 
-    # NLTK sentence split
+    # Download NLTK data if needed
     try:
         nltk.data.find("tokenizers/punkt")
     except LookupError:
         nltk.download("punkt", quiet=True)
 
-    # FIXED: tiktoken with stable encoding
+    # Tiktoken for accurate token counting
     try:
         import tiktoken
-        enc = tiktoken.get_encoding("cl100k_base")  # Always available
+        TOKENIZER = tiktoken.get_encoding("cl100k_base")
     except Exception:
-        enc = None
+        TOKENIZER = None
 
-    # IMPROVED: Device detection with better compatibility
-    if (
-        platform.machine() in {"arm64", "aarch64"}
-        and torch.backends.mps.is_available()
-    ):
+    # Device selection
+    if platform.machine() in {"arm64", "aarch64"} and torch.backends.mps.is_available():
         DEVICE = torch.device("mps")
-        DEVICE_STR = "cpu"  # For sentence-transformers compatibility
-        log.info("🍎 Using Apple Silicon MPS backend")
+        DEVICE_STR = "cpu"  # sentence-transformers compatibility
     elif torch.cuda.is_available():
         DEVICE = torch.device("cuda")
         DEVICE_STR = "cuda"
-        log.info("⚡ Using CUDA backend")
     else:
         DEVICE = torch.device("cpu")
         DEVICE_STR = "cpu"
-        log.info("💻 Using CPU backend")
+    
+    log.info(f"Provenance Pruning: Using {DEVICE} backend")
+
 except Exception as e:
     ML_AVAILABLE = False
     DEVICE = None
     DEVICE_STR = "cpu"
-    log.warning(f"⚠️ ML stack unavailable: {e}")
+    log.error(f"ML dependencies unavailable: {e}")
 
-# ---------------------------------------------------------------------------
-# IMPROVED: Settings with better defaults and clear descriptions
-# ---------------------------------------------------------------------------
+
 class ProvenanceSettings(BaseModel):
-    """Plugin settings editable from the Admin UI."""
-
+    """Plugin settings for intelligent document pruning."""
+    
     enable_pruning: bool = Field(
         True, 
-        description="🔥 Enable/disable intelligent sentence-level pruning"
+        description="Enable intelligent sentence-level pruning"
     )
     keep_ratio: float = Field(
         0.5,
         ge=0.1,
         le=0.95,
-        description="📊 Fraction of sentences to KEEP (0.5 = keep 50%, remove 50%). Higher = more conservative.",
+        description="Fraction of sentences to keep (0.5 = 50%)",
     )
     min_tokens_for_pruning: int = Field(
         1500,
         ge=200,
         le=8000,
-        description="🚪 Skip pruning if context has fewer tokens (higher = less aggressive). 1500+ recommended for narratives.",
+        description="Skip pruning if document has fewer tokens",
     )
     preserve_head_tail: int = Field(
         4,
         ge=0,
         le=10,
-        description="🔒 Sentences GUARANTEED preserved from document start & end. Essential for narrative context.",
+        description="Number of sentences to preserve at start/end",
     )
     digit_bonus: float = Field(
         0.60,
         ge=0.0,
         le=1.0,
-        description="🔢 Score bonus for sentences with numbers/dates/quantities (0.25 = +25% score). Great for chronologies.",
+        description="Score bonus for sentences with numbers/dates",
     )
     neighbor_window: bool = Field(
         True,
-        description="🔗 Expand selection to include adjacent sentences for context continuity. Preserves reference chains.",
+        description="Include adjacent sentences for context continuity",
     )
-    # FIXED: Default to TRUE Provenance instead of empty fallback
     classifier_model: str = Field(
         "cross-encoder/ms-marco-MiniLM-L6-v2",
-        description="🧠 HuggingFace model for TRUE relevance classification. Default uses real Provenance algorithm. Leave empty for cosine similarity fallback.",
+        description="HuggingFace model for relevance classification",
     )
     embed_model: str = Field(
         "sentence-transformers/all-MiniLM-L6-v2",
-        description="📐 Embedding model for cosine similarity fallback (only used if classifier fails to load).",
+        description="Embedding model for similarity fallback",
     )
     hf_token: str = Field(
         "", 
-        description="🔑 HuggingFace access token (only needed for private/gated models). Leave empty for public models.",
+        description="HuggingFace token for private models",
     )
     cache_enabled: bool = Field(
         True, 
-        description="💾 Cache pruning results in memory for faster repeated queries"
+        description="Cache pruning results"
+    )
+    cache_max_size: int = Field(
+        100,
+        ge=10,
+        le=1000,
+        description="Maximum cache entries",
     )
 
     model_config = {"protected_namespaces": ()}
@@ -131,589 +130,585 @@ class ProvenanceSettings(BaseModel):
 def settings_model():
     return ProvenanceSettings
 
-# ---------------------------------------------------------------------------
-# FIXED: Enhanced PruningClient with support for Provence Reranker
-# ---------------------------------------------------------------------------
+
 class PruningClient:
+    """Handles document pruning with multiple relevance scoring strategies."""
+    
+    MAX_BATCH_SIZE = 32
+    TOKEN_ESTIMATE_MULTIPLIER = 1.3
+    
     def __init__(self, settings: ProvenanceSettings):
         if not ML_AVAILABLE:
-            raise RuntimeError("ML stack missing – cannot create client")
+            raise RuntimeError("ML dependencies not available")
+            
         self.settings = settings
         self._embed_model: Optional[SentenceTransformer] = None
-        # This can now be a Pipeline OR a custom Provence model object
-        self._classifier: Optional[Any] = None 
-        self._cache: Dict[str, Tuple[str, Dict[str, Any]]] = {}
-        self._lock = threading.Lock()
+        self._classifier: Optional[Union[TextClassificationPipeline, Any]] = None
+        self._cache = OrderedDict()  # LRU cache
+        self._model_lock = threading.Lock()
+        self._cache_lock = threading.Lock()
 
-    def _load_embedder(self) -> SentenceTransformer:
+    def _ensure_embedder(self) -> SentenceTransformer:
+        """Load embedding model with thread safety."""
         if self._embed_model is not None:
             return self._embed_model
-        model = SentenceTransformer(
-            self.settings.embed_model, 
-            device=DEVICE_STR
-        )
-        self._embed_model = model
-        log.info(f"🧩 Embedding model loaded: {self.settings.embed_model}")
-        return model
+            
+        with self._model_lock:
+            if self._embed_model is None:
+                self._embed_model = SentenceTransformer(
+                    self.settings.embed_model, 
+                    device=DEVICE_STR
+                )
+                log.info(f"Loaded embedder: {self.settings.embed_model}")
+                
+        return self._embed_model
 
-    def _load_classifier(self) -> Optional[Any]:
+    def _ensure_classifier(self) -> Optional[Any]:
+        """Load classifier model with thread safety."""
         if not self.settings.classifier_model:
-            log.info("📐 No classifier configured - using cosine similarity fallback")
             return None
             
         if self._classifier is not None:
             return self._classifier
             
-        log.info(f"🔬 Loading classifier/reranker: {self.settings.classifier_model}")
+        with self._model_lock:
+            if self._classifier is None:
+                self._classifier = self._load_classifier_model()
+                
+        return self._classifier
+    
+    def _load_classifier_model(self) -> Optional[Any]:
+        """Load appropriate classifier based on model name."""
+        model_name = self.settings.classifier_model
         
-        # --- START PROVENCE-SPECIFIC LOGIC ---
-        is_provence_model = "naver/provence-reranker" in self.settings.classifier_model
-        if is_provence_model:
-            log.info("🧠 Detected Provence Reranker model. Using custom API.")
+        # Check for Provence reranker
+        if "provence-reranker" in model_name.lower():
             try:
-                # Provence requires AutoModel and trust_remote_code=True
                 model = AutoModel.from_pretrained(
-                    self.settings.classifier_model,
+                    model_name,
                     trust_remote_code=True,
                     token=self.settings.hf_token or None,
-                ).to(DEVICE or "cpu")
-                self._classifier = model
-                log.info(f"✅ TRUE Provence Reranker loaded successfully!")
-                return self._classifier
+                ).to(DEVICE)
+                log.info(f"Loaded Provence reranker: {model_name}")
+                return model
             except Exception as e:
-                log.warning(f"❌ TRUE Provence Reranker failed to load: {e}")
-                log.warning("⚠️ All classifiers failed - falling back to cosine similarity")
-                self._classifier = None
+                log.error(f"Failed to load Provence model: {e}")
                 return None
-        # --- END PROVENCE-SPECIFIC LOGIC ---
-
-        # Fallback to standard TextClassificationPipeline for other models
+        
+        # Standard cross-encoder
         try:
             tokenizer = AutoTokenizer.from_pretrained(
-                self.settings.classifier_model, token=self.settings.hf_token or None
+                model_name, 
+                token=self.settings.hf_token or None
             )
             model = AutoModelForSequenceClassification.from_pretrained(
-                self.settings.classifier_model,
+                model_name,
                 token=self.settings.hf_token or None,
-            ).to(DEVICE or "cpu")
-            pipe = TextClassificationPipeline(
+            ).to(DEVICE)
+            
+            pipeline = TextClassificationPipeline(
                 model=model,
                 tokenizer=tokenizer,
                 top_k=1,
                 function_to_apply="sigmoid",
-                device=0 if DEVICE and DEVICE.type == "cuda" else -1,
+                device=0 if DEVICE.type == "cuda" else -1,
             )
-            self._classifier = pipe
-            log.info(f"✅ Cross-Encoder classifier loaded successfully!")
-            return pipe
+            log.info(f"Loaded cross-encoder: {model_name}")
+            return pipeline
             
         except Exception as e:
-            log.warning(f"❌ Cross-Encoder classifier failed to load: {e}")
-            log.warning("⚠️ All classifiers failed - falling back to cosine similarity")
-            self._classifier = None
+            log.error(f"Failed to load classifier: {e}")
             return None
 
     @staticmethod
-    def _sentence_split(text: str) -> List[str]:
+    def split_sentences(text: str) -> List[str]:
+        """Split text into sentences."""
         try:
             return nltk.sent_tokenize(text)
         except Exception:
-            return [s.strip() for s in text.split(".") if s.strip()]
+            # Fallback to simple split
+            return [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
 
-    def _token_len(self, text: str) -> int:
-        if enc:
+    def estimate_tokens(self, text: str) -> int:
+        """Estimate token count."""
+        if TOKENIZER:
             try:
-                return len(enc.encode(text))
+                return len(TOKENIZER.encode(text))
             except Exception:
                 pass
-        return int(len(text.split()) * 1.3)
+        return int(len(text.split()) * self.TOKEN_ESTIMATE_MULTIPLIER)
 
-    def _cosine_scores(self, query: str, sentences: List[str]) -> List[float]:
-        embedder = self._load_embedder()
+    def _score_with_embeddings(self, query: str, sentences: List[str]) -> List[float]:
+        """Score sentences using cosine similarity."""
+        embedder = self._ensure_embedder()
+        
         with torch.no_grad():
-            emb = embedder.encode([query] + sentences, normalize_embeddings=True)
-        query_emb, sent_emb = emb[0:1], emb[1:]
-        scores = cosine_similarity(query_emb, sent_emb)[0]
+            embeddings = embedder.encode(
+                [query] + sentences, 
+                normalize_embeddings=True,
+                show_progress_bar=False
+            )
+            
+        query_emb = embeddings[0:1]
+        sent_embs = embeddings[1:]
+        scores = cosine_similarity(query_emb, sent_embs)[0]
+        
         return scores.tolist()
 
-    def _classifier_scores(self, query: str, sentences: List[str]) -> Optional[List[float]]:
-        pipe = self._classifier
-        if pipe is None or not isinstance(pipe, TextClassificationPipeline):
+    def _score_with_classifier(self, query: str, sentences: List[str]) -> Optional[List[float]]:
+        """Score sentences using classifier model."""
+        classifier = self._ensure_classifier()
+        if classifier is None:
             return None
+            
+        # Handle Provence model
+        if hasattr(classifier, 'process'):
+            # Provence uses a different API - return None to use fallback
+            return None
+            
+        # Standard classifier pipeline
         try:
             inputs = [{"text": query, "text_pair": s} for s in sentences]
-            preds = pipe(inputs, batch_size=min(32, len(inputs)))
-            # Ensure correct score extraction if output is nested
-            return [p[0]['score'] if isinstance(p, list) else p['score'] for p in preds]
+            
+            # Process in batches
+            all_scores = []
+            for i in range(0, len(inputs), self.MAX_BATCH_SIZE):
+                batch = inputs[i:i + self.MAX_BATCH_SIZE]
+                predictions = classifier(batch)
+                
+                # Extract scores
+                for pred in predictions:
+                    score = pred[0]['score'] if isinstance(pred, list) else pred['score']
+                    all_scores.append(score)
+                    
+            return all_scores
+            
         except Exception as e:
-            log.warning(f"Classifier inference failed → fallback ({e})")
+            log.warning(f"Classifier scoring failed: {e}")
             return None
 
-    def _enhanced_scoring(self, query: str, sentences: List[str]) -> List[float]:
-        scores = self._classifier_scores(query, sentences)
-        if scores is None:
-            scores = self._cosine_scores(query, sentences)
-        
-        total = len(sentences)
-        bias_head_tail = self.settings.preserve_head_tail
+    def _apply_scoring_bonuses(
+        self, 
+        sentences: List[str], 
+        base_scores: List[float]
+    ) -> List[float]:
+        """Apply position and content bonuses to scores."""
         enhanced_scores = []
+        total = len(sentences)
         
-        for idx, (sent, base_score) in enumerate(zip(sentences, scores)):
-            pos_bonus = 0.1 if idx < bias_head_tail or idx >= total - bias_head_tail else 0.0
+        for idx, (sent, score) in enumerate(zip(sentences, base_scores)):
+            # Position bonus for head/tail
+            in_head = idx < self.settings.preserve_head_tail
+            in_tail = idx >= total - self.settings.preserve_head_tail
+            position_bonus = 0.1 if (in_head or in_tail) else 0.0
+            
+            # Digit bonus
             has_digit = bool(re.search(r'\d', sent))
             digit_bonus = self.settings.digit_bonus if has_digit else 0.0
-            final_score = base_score + pos_bonus + digit_bonus
-            enhanced_scores.append(final_score)
-        
+            
+            final_score = score + position_bonus + digit_bonus
+            enhanced_scores.append(min(final_score, 1.0))  # Cap at 1.0
+            
         return enhanced_scores
 
-    def _select_with_guarantees(self, sentences: List[str], scores: List[float]) -> List[int]:
+    def _select_sentences(
+        self, 
+        sentences: List[str], 
+        scores: List[float]
+    ) -> List[int]:
+        """Select sentences to keep based on scores and constraints."""
         total = len(sentences)
-        bias_head_tail = self.settings.preserve_head_tail
         
-        forced_idx = set()
-        if bias_head_tail > 0:
-            forced_idx.update(range(min(bias_head_tail, total)))
-            if total > bias_head_tail:
-                forced_idx.update(range(max(0, total - bias_head_tail), total))
+        # Forced indices (head/tail)
+        forced_indices = set()
+        if self.settings.preserve_head_tail > 0:
+            head_count = min(self.settings.preserve_head_tail, total)
+            tail_start = max(0, total - self.settings.preserve_head_tail)
+            
+            forced_indices.update(range(head_count))
+            if tail_start < total:
+                forced_indices.update(range(tail_start, total))
         
-        keep = max(len(forced_idx) + 1, int(total * self.settings.keep_ratio))
-        keep = min(keep, total)
+        # Calculate target count
+        min_keep = len(forced_indices) + 1
+        target_keep = max(min_keep, int(total * self.settings.keep_ratio))
+        target_keep = min(target_keep, total)
         
-        scored = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
+        # Select top scoring sentences
+        scored_indices = sorted(
+            enumerate(scores), 
+            key=lambda x: x[1], 
+            reverse=True
+        )
         
-        selected_idx = set(forced_idx)
-        for idx, _ in scored:
-            if len(selected_idx) >= keep:
+        selected = set(forced_indices)
+        for idx, _ in scored_indices:
+            if len(selected) >= target_keep:
                 break
-            selected_idx.add(idx)
+            selected.add(idx)
         
+        # Apply neighbor window expansion
         if self.settings.neighbor_window:
-            expanded_idx = set(selected_idx)
-            for idx in list(selected_idx):
+            expanded = set(selected)
+            for idx in selected:
                 if idx > 0:
-                    expanded_idx.add(idx - 1)
+                    expanded.add(idx - 1)
                 if idx < total - 1:
-                    expanded_idx.add(idx + 1)
-            selected_idx = expanded_idx
+                    expanded.add(idx + 1)
+            selected = expanded
         
-        selected_idx = {idx for idx in selected_idx if 0 <= idx < total}
-        return sorted(list(selected_idx))
+        # Ensure valid indices
+        selected = {idx for idx in selected if 0 <= idx < total}
+        
+        return sorted(list(selected))
+
+    def _get_cache_key(self, document: str, query: str) -> str:
+        """Generate cache key."""
+        data = {
+            "doc": document,
+            "query": query,
+            "settings": self.settings.model_dump_json()
+        }
+        return hashlib.sha256(
+            json.dumps(data, sort_keys=True).encode()
+        ).hexdigest()
+
+    def _cache_get(self, key: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+        """Get from cache with LRU eviction."""
+        with self._cache_lock:
+            if key in self._cache:
+                # Move to end (most recent)
+                self._cache.move_to_end(key)
+                return self._cache[key]
+        return None
+
+    def _cache_put(self, key: str, value: Tuple[str, Dict[str, Any]]):
+        """Put in cache with size limit."""
+        if not self.settings.cache_enabled:
+            return
+            
+        with self._cache_lock:
+            self._cache[key] = value
+            self._cache.move_to_end(key)
+            
+            # Evict oldest if over limit
+            while len(self._cache) > self.settings.cache_max_size:
+                self._cache.popitem(last=False)
 
     def prune(self, document: str, query: str) -> Tuple[str, Dict[str, Any]]:
+        """
+        Prune document based on query relevance.
+        Returns (pruned_text, metadata).
+        """
         if not document.strip():
-            return document, {"compression": 0, "sentences_kept": 0, "sentences_total": 0}
+            return document, {
+                "compression": 0, 
+                "sentences_kept": 0, 
+                "sentences_total": 0
+            }
 
-        if self.settings.cache_enabled:
-            # Cache key must include model name to differentiate logic
-            cache_key = hashlib.sha256(
-                json.dumps([document, query, self.settings.model_dump_json()], sort_keys=True).encode()
-            ).hexdigest()
-            if cache_key in self._cache:
-                return self._cache[cache_key]
+        # Check cache
+        cache_key = self._get_cache_key(document, query)
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
 
-        start = time.time()
+        start_time = time.time()
         
-        classifier = self._load_classifier()
-        is_provence_model = classifier and not isinstance(classifier, TextClassificationPipeline)
-
-        # --- NEW LOGIC BRANCH FOR PROVENCE ---
-        if is_provence_model:
-            log.debug("Using Provence Reranker .process() method")
-            try:
-                # Use the model's native process method
-                result = classifier.process(question=query, context=document)
-                pruned_text = result['pruned_context']
-                
-                # Calculate metadata after the fact
-                original_sentences = self._sentence_split(document)
-                pruned_sentences = self._sentence_split(pruned_text)
-                total_sent = len(original_sentences)
-                kept_sent = len(pruned_sentences)
-
-                meta = {
-                    "compression": 1 - (kept_sent / total_sent) if total_sent > 0 else 0,
-                    "sentences_kept": kept_sent,
-                    "sentences_total": total_sent,
-                    "processing_time": round(time.time() - start, 3),
-                    "algorithm": "Provence Reranker",
-                    "reranking_score": result.get('reranking_score', -1)
-                }
-
-                if self.settings.cache_enabled:
-                    self._cache[cache_key] = (pruned_text, meta)
-                return pruned_text, meta
-
-            except Exception as e:
-                log.error(f"Provence .process() failed: {e}. Falling back to cosine similarity.")
-                # Fall through to the original logic if the custom method fails
-
-        # --- ORIGINAL LOGIC (FALLBACK) ---
-        log.debug("Using sentence-wise scoring logic")
-        sentences = self._sentence_split(document)
+        # Check for Provence model special case
+        classifier = self._ensure_classifier()
+        if classifier and hasattr(classifier, 'process'):
+            return self._prune_with_provence(
+                document, query, classifier, start_time, cache_key
+            )
+        
+        # Standard pruning logic
+        return self._prune_standard(document, query, start_time, cache_key)
+    
+    def _prune_with_provence(
+        self, 
+        document: str, 
+        query: str, 
+        model: Any,
+        start_time: float,
+        cache_key: str
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Prune using Provence reranker model."""
+        try:
+            result = model.process(question=query, context=document)
+            pruned_text = result['pruned_context']
+            
+            # Calculate metadata
+            original_sentences = self.split_sentences(document)
+            pruned_sentences = self.split_sentences(pruned_text)
+            
+            metadata = {
+                "compression": 1 - (len(pruned_sentences) / len(original_sentences)),
+                "sentences_kept": len(pruned_sentences),
+                "sentences_total": len(original_sentences),
+                "processing_time": round(time.time() - start_time, 3),
+                "algorithm": "Provence Reranker",
+                "reranking_score": result.get('reranking_score', -1)
+            }
+            
+            self._cache_put(cache_key, (pruned_text, metadata))
+            return pruned_text, metadata
+            
+        except Exception as e:
+            log.error(f"Provence pruning failed: {e}")
+            # Fall back to standard pruning
+            return self._prune_standard(document, query, start_time, cache_key)
+    
+    def _prune_standard(
+        self, 
+        document: str, 
+        query: str,
+        start_time: float,
+        cache_key: str
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Standard sentence-wise pruning."""
+        sentences = self.split_sentences(document)
         total = len(sentences)
         
         if total == 0:
-            return document, {"compression": 0, "sentences_kept": 0, "sentences_total": 0}
-
-        min_sentences_for_pruning = max(5, int(3 / self.settings.keep_ratio))
-        if total <= min_sentences_for_pruning:
-            return document, {"compression": 0, "sentences_kept": total, "sentences_total": total}
-
-        scores = self._enhanced_scoring(query, sentences)
-        selected_idx = self._select_with_guarantees(sentences, scores)
+            return document, {
+                "compression": 0,
+                "sentences_kept": 0,
+                "sentences_total": 0
+            }
         
-        pruned_text = " ".join([sentences[i] for i in selected_idx])
+        # Skip pruning for very short documents
+        min_sentences = max(5, int(3 / self.settings.keep_ratio))
+        if total <= min_sentences:
+            return document, {
+                "compression": 0,
+                "sentences_kept": total,
+                "sentences_total": total
+            }
         
-        meta = {
-            "compression": 1 - (len(selected_idx) / total),
-            "sentences_kept": len(selected_idx),
+        # Score sentences
+        base_scores = self._score_with_classifier(query, sentences)
+        if base_scores is None:
+            base_scores = self._score_with_embeddings(query, sentences)
+            algorithm = "Cosine Similarity"
+        else:
+            algorithm = "Cross-Encoder"
+        
+        # Apply bonuses and select
+        final_scores = self._apply_scoring_bonuses(sentences, base_scores)
+        selected_indices = self._select_sentences(sentences, final_scores)
+        
+        # Build pruned text
+        pruned_text = " ".join([sentences[i] for i in selected_indices])
+        
+        metadata = {
+            "compression": 1 - (len(selected_indices) / total),
+            "sentences_kept": len(selected_indices),
             "sentences_total": total,
-            "processing_time": round(time.time() - start, 3),
+            "processing_time": round(time.time() - start_time, 3),
+            "algorithm": algorithm,
             "forced_head_tail": min(self.settings.preserve_head_tail * 2, total),
             "neighbor_expansion": self.settings.neighbor_window,
-            "algorithm": "Cross-Encoder or Cosine Similarity"
         }
         
-        if self.settings.cache_enabled:
-            # Use the same cache key as defined earlier
-            self._cache[cache_key] = (pruned_text, meta)
-        
-        return pruned_text, meta
+        self._cache_put(cache_key, (pruned_text, metadata))
+        return pruned_text, metadata
 
 
-# ---------------------------------------------------------------------------
 # Global client management
-# ---------------------------------------------------------------------------
 _CLIENT: Optional[PruningClient] = None
+_CLIENT_LOCK = threading.Lock()
 
-def _get_client(cat) -> Optional[PruningClient]:
+
+def get_client(cat) -> Optional[PruningClient]:
+    """Get or create pruning client."""
     global _CLIENT
+    
     if not ML_AVAILABLE:
         return None
+        
     try:
-        raw = cat.mad_hatter.get_plugin().load_settings()
-        settings = ProvenanceSettings(**raw)
+        raw_settings = cat.mad_hatter.get_plugin().load_settings()
+        settings = ProvenanceSettings(**raw_settings)
     except ValidationError as e:
-        log.error(f"Pruning settings invalid: {e}")
+        log.error(f"Invalid settings: {e}")
         return None
-
-    if _CLIENT is None or _CLIENT.settings != settings:
-        try:
-            _CLIENT = PruningClient(settings)
-        except Exception as e:
-            log.error(f"Cannot init PruningClient: {e}")
-            _CLIENT = None
+    
+    with _CLIENT_LOCK:
+        if _CLIENT is None or _CLIENT.settings != settings:
+            try:
+                _CLIENT = PruningClient(settings)
+            except Exception as e:
+                log.error(f"Failed to create client: {e}")
+                _CLIENT = None
+                
     return _CLIENT
 
-# ---------------------------------------------------------------------------
-# IMPROVED: Hooks with better logging
-# ---------------------------------------------------------------------------
+
+# Hooks
 @hook(priority=2)
 def before_cat_recalls_declarative_memories(cfg, cat):
+    """Increase retrieval for better pruning candidates."""
     try:
         settings = ProvenanceSettings(**cat.mad_hatter.get_plugin().load_settings())
         if settings.enable_pruning:
             original_k = cfg.get("k", 3)
-            cfg["k"] = min(original_k * 2, 12)  # Slightly higher for more content
-            log.debug(f"🔍 Increased retrieval: {original_k} → {cfg['k']}")
+            cfg["k"] = min(original_k * 2, 12)
     except Exception:
         pass
     return cfg
 
+
 @hook(priority=1)
 def after_cat_recalls_declarative_memories(memories, cat):
-    """Apply sentence‑level pruning with global compression tracking."""
+    """Apply intelligent pruning to recalled memories."""
     if not memories:
         return memories
         
-    client = _get_client(cat)
-    if client is None:
+    client = get_client(cat)
+    if client is None or not client.settings.enable_pruning:
         return memories
-
-    settings = client.settings
-    if not settings.enable_pruning:
-        return memories
-
-    # Check if pruning needed based on total tokens
+    
+    # Check total token count
     try:
         total_text = "\n".join([doc.page_content for doc, _ in memories])
-        if client._token_len(total_text) < settings.min_tokens_for_pruning:
-            log.debug(f"📝 Skipping pruning: {client._token_len(total_text)} < {settings.min_tokens_for_pruning} tokens")
+        if client.estimate_tokens(total_text) < client.settings.min_tokens_for_pruning:
             return memories
     except Exception:
         pass
-
+    
+    # Prune each memory
     query = cat.working_memory.user_message_json.text
     pruned_memories = []
     
-    # FIXED: Global compression tracking
     total_sentences = 0
     kept_sentences = 0
-    total_processing_time = 0
+    total_time = 0
     
     for doc, score in memories:
         new_doc = deepcopy(doc)
-        pruned, meta = client.prune(doc.page_content, query)
-        new_doc.page_content = pruned
+        pruned_text, metadata = client.prune(doc.page_content, query)
+        new_doc.page_content = pruned_text
         pruned_memories.append((new_doc, score))
         
-        # Accumulate stats
-        total_sentences += meta["sentences_total"]
-        kept_sentences += meta["sentences_kept"]
-        total_processing_time += meta["processing_time"]
-
-    # FIXED: Accurate global compression logging
+        total_sentences += metadata["sentences_total"]
+        kept_sentences += metadata["sentences_kept"]
+        total_time += metadata["processing_time"]
+    
+    # Log summary
     if total_sentences > 0:
-        global_compression = 1 - (kept_sentences / total_sentences)
+        compression = 1 - (kept_sentences / total_sentences)
         log.info(
-            f"✂️ Enhanced Pruning: {kept_sentences}/{total_sentences} sentences "
-            f"({global_compression:.1%} compression) in {total_processing_time:.3f}s"
+            f"Pruning complete: {kept_sentences}/{total_sentences} sentences "
+            f"({compression:.1%} compression) in {total_time:.3f}s"
         )
     
     return pruned_memories
 
-# ---------------------------------------------------------------------------
-# ENHANCED: Tools with better diagnostics
-# ---------------------------------------------------------------------------
+
+# Tools
 @tool
 def pruning_status(tool_input, cat):
-    """Return comprehensive pruning system status with algorithm info."""
+    """Get pruning system status."""
     if not ML_AVAILABLE:
-        return "❌ ML stack not available – pruning disabled."
+        return "ML dependencies not available - pruning disabled."
     
-    client = _get_client(cat)
+    client = get_client(cat)
     if client is None:
-        return "⚠️ Pruning client not initialised. Check logs."
+        return "Pruning client not initialized. Check configuration."
     
     s = client.settings
     
-    # Determine which algorithm is actually being used
-    classifier_status = "❌ Not configured"
-    algorithm_info = ""
-    warnings = []
+    # Check classifier status
+    classifier_info = "Not configured"
+    algorithm = "Cosine Similarity"
     
     if s.classifier_model:
         try:
-            clf = client._load_classifier()
+            clf = client._ensure_classifier()
             if clf is not None:
-                classifier_status = f"✅ {s.classifier_model}"
-                algorithm_info = "🧠 **Using TRUE Provenance Algorithm** - Best quality for complex narratives"
-            else:
-                classifier_status = f"❌ Failed to load {s.classifier_model}"
-                algorithm_info = "📐 **Using Cosine Similarity Fallback** - May miss reference chains"
-                warnings.append("⚠️ Classifier failed - consider using microsoft/deberta-v3-base as alternative")
-        except Exception as e:
-            classifier_status = f"❌ Error: {str(e)[:50]}..."
-            algorithm_info = "📐 **Using Cosine Similarity Fallback**"
-            warnings.append("⚠️ Check internet connection for model download")
-    else:
-        algorithm_info = "📐 **Using Cosine Similarity Fallback** - Consider setting classifier_model for better results"
-        warnings.append("💡 Set classifier_model to 'thenlper/provenance-sentence-roberta-base' for TRUE Provenance")
-    
-    out = [
-        "**🪄 Enhanced Provenance Pruning Status**",
-        "",
-        algorithm_info,
-        "",
-        "**🔧 Configuration:**",
-        f"- Enabled: {'✅' if s.enable_pruning else '❌'}",
-        f"- Device: {DEVICE} ({DEVICE_STR})",
-        f"- Keep ratio: {s.keep_ratio:.1%} ({'conservative' if s.keep_ratio >= 0.6 else 'aggressive' if s.keep_ratio <= 0.4 else 'balanced'})",
-        f"- Min tokens: {s.min_tokens_for_pruning:,}",
-        f"- Head/tail preserve: {s.preserve_head_tail} sentences",
-        f"- Digit bonus: {s.digit_bonus} ({'enabled' if s.digit_bonus > 0 else 'disabled'})",
-        f"- Neighbor window: {'✅' if s.neighbor_window else '❌'}",
-        "",
-        "**🤖 Models:**",
-        f"- Classifier: {classifier_status}",
-        f"- Embedder: {s.embed_model}",
-        f"- Cache entries: {len(client._cache)}",
-    ]
-    
-    if warnings:
-        out.append("")
-        out.append("**⚠️ Recommendations:**")
-        out.extend([f"- {w}" for w in warnings])
-    
-    return "\n".join(out)
-
-@tool
-def pruning_diagnostics(tool_input, cat):
-    """Run comprehensive system diagnostics with troubleshooting suggestions."""
-    if not ML_AVAILABLE:
-        return "❌ ML stack missing. Install: pip install torch sentence-transformers transformers nltk tiktoken scikit-learn"
-    
-    client = _get_client(cat)
-    if client is None:
-        return "❌ Cannot init client – check plugin configuration and restart Cheshire Cat."
-    
-    diag = ["**🔧 Enhanced Diagnostics & Troubleshooting**", ""]
-    
-    # System info
-    import torch as _t
-    diag.append(f"**🖥️ System:**")
-    diag.append(f"- PyTorch: {_t.__version__}")
-    diag.append(f"- Device: {DEVICE}")
-    diag.append(f"- Device String: {DEVICE_STR}")
-    diag.append(f"- Memory available: {torch.cuda.get_device_properties(0).total_memory // 1024**3 if torch.cuda.is_available() else 'N/A (CPU)'}")
-    diag.append("")
-    
-    # Model tests with detailed feedback
-    diag.append("**🤖 Models:**")
-    
-    # Test embedder
-    try:
-        embedder = client._load_embedder()
-        test_emb = embedder.encode(["test sentence"])
-        diag.append(f"- Embedder: ✅ {client.settings.embed_model} - Shape: {test_emb.shape}")
-    except Exception as e:
-        diag.append(f"- Embedder: ❌ {e}")
-        diag.append("  💡 Try: pip install sentence-transformers --upgrade")
-    
-    # Test classifier with detailed status
-    if client.settings.classifier_model:
-        try:
-            clf = client._load_classifier()
-            if clf:
-                # Differentiate between Provence model and standard pipeline
-                is_provence_model = not isinstance(clf, TextClassificationPipeline)
-
-                if is_provence_model:
-                    # Test Provence model with its specific .process() method
-                    test_result = clf.process(question="test query", context="this is a test sentence for diagnostics.")
-                    score = test_result.get('reranking_score', -1)
-                    diag.append(f"- Classifier: ✅ TRUE Provence Reranker active - Test score: {score:.3f}")
-                    diag.append("  🧠 Using advanced reranking and pruning.")
+                if hasattr(clf, 'process'):
+                    algorithm = "Provence Reranker"
                 else:
-                    # Test standard pipeline model
-                    test_input = [{"text": "test query", "text_pair": "test sentence"}]
-                    result = clf(test_input)
-                    # Robustly extract score from potentially nested list
-                    first_result = result[0]
-                    score = first_result[0]['score'] if isinstance(first_result, list) else first_result['score']
-                    diag.append(f"- Classifier: ✅ Cross-Encoder active - Test score: {score:.3f}")
-                    diag.append("  🧠 Using advanced relevance classification.")
+                    algorithm = "Cross-Encoder"
+                classifier_info = f"Active: {s.classifier_model}"
             else:
-                diag.append(f"- Classifier: ❌ Failed to load {client.settings.classifier_model}")
-                diag.append("  📐 Falling back to cosine similarity")
-                diag.append("  💡 Try alternative: microsoft/deberta-v3-base")
-        except Exception as e:
-            diag.append(f"- Classifier: ❌ {e}")
-            diag.append("  💡 Check internet connection for model download")
-            diag.append("  💡 Try: huggingface-cli login (if model requires auth)")
-    else:
-        diag.append("- Classifier: 📝 No classifier model configured. Using cosine similarity.")
-        diag.append("  💡 Set a model like 'naver/provence-reranker-debertav3-v1' for better results.")
+                classifier_info = f"Failed to load: {s.classifier_model}"
+        except Exception:
+            classifier_info = "Error loading classifier"
+    
+    status = f"""**Provenance Pruning Status**
 
-    diag.append("")
-    diag.append("**🚀 Features:**")
-    diag.append(f"- Digit bonus: {'✅ +' + str(int(client.settings.digit_bonus * 100)) + '%' if client.settings.digit_bonus > 0 else '❌ Disabled'}")
-    diag.append(f"- Neighbor window: {'✅ Context expansion enabled' if client.settings.neighbor_window else '❌ Disabled'}")
-    diag.append(f"- Head/tail preserve: {'✅ ' + str(client.settings.preserve_head_tail) + ' sentences guaranteed' if client.settings.preserve_head_tail > 0 else '❌ Disabled'}")
-    
-    # Performance tips
-    diag.append("")
-    diag.append("**⚡ Performance Tips:**")
-    if client.settings.keep_ratio < 0.4:
-        diag.append("- ⚠️ Very aggressive pruning (keep_ratio < 0.4) - may lose important context")
-    if client.settings.preserve_head_tail < 2:
-        diag.append("- ⚠️ Low head/tail preservation - narrative context may be lost")
-    if not client.settings.neighbor_window:
-        diag.append("- ⚠️ Neighbor window disabled - reference chains may break")
-    
-    # Memory and caching info
-    diag.append(f"- Cache: {'✅ ' + str(len(client._cache)) + ' entries' if client.settings.cache_enabled else '❌ Disabled'}")
-    
-    return "\n".join(diag)
+**Configuration:**
+- Enabled: {'Yes' if s.enable_pruning else 'No'}
+- Algorithm: {algorithm}
+- Keep ratio: {s.keep_ratio:.1%}
+- Min tokens: {s.min_tokens_for_pruning:,}
+- Preserve head/tail: {s.preserve_head_tail} sentences
+- Digit bonus: {s.digit_bonus:.1f}
+- Neighbor window: {'Yes' if s.neighbor_window else 'No'}
+- Cache: {len(client._cache)}/{s.cache_max_size} entries
 
-@tool
-def test_enhanced_pruning(query: str, cat):
-    """Test enhanced pruning features on sample text with numbers and structure."""
+**Models:**
+- Classifier: {classifier_info}
+- Embedder: {s.embed_model}
+- Device: {DEVICE}
+"""
+    
+    return status
+
+
+@tool  
+def test_pruning(query: str, cat):
+    """Test pruning on sample text."""
     if not ML_AVAILABLE:
-        return "❌ ML stack missing."
+        return "ML dependencies not available."
     
-    client = _get_client(cat)
+    client = get_client(cat)
     if client is None:
-        return "❌ Client not available."
+        return "Client not available."
     
-    # Sample text with numbers, structure, and narrative elements
-    doc = (
-        "Nel 1511 Erasmo da Rotterdam scrive l'Elogio della pazzia. "
-        "L'opera critica la società del tempo con ironia e satira. "
-        "Benvenuto Cellini nasce nel 1500 a Firenze da Giovanni. "
-        "La sua autobiografia contiene 142 capitoli e copre 71 anni di vita. "
-        "Michelangelo scolpisce il David tra il 1501 e il 1504. "
-        "L'opera è alta 5,17 metri e pesa circa 6 tonnellate. "
-        "La tecnica dell'oreficeria richiede 10 parti di rame e 2 di stagno. "
-        "Cellini perfeziona questa proporzione nella sua bottega fiorentina. "
-        "Il Rinascimento italiano vede fiorire arte, letteratura e filosofia. "
-        "Molti artisti viaggiano tra Roma, Firenze e Venezia per lavoro."
-    )
+    # Sample document
+    sample = """The Renaissance began in Italy during the 14th century. 
+    Florence became the cultural center of this movement in 1420.
+    Artists like Michelangelo created masterpieces between 1475 and 1564.
+    The printing press was invented by Gutenberg in 1440.
+    This innovation spread knowledge across Europe rapidly.
+    By 1500, over 20 million books had been printed.
+    The Renaissance influenced art, science, and philosophy.
+    Many ideas from this period still shape modern thinking."""
     
-    pruned, meta = client.prune(doc, query)
+    pruned, metadata = client.prune(sample, query)
     
-    # Analysis
-    original_sentences = client._sentence_split(doc)
-    kept_sentences = client._sentence_split(pruned)
-    
-    digit_sentences = [s for s in original_sentences if re.search(r'\d', s)]
-    digit_kept = [s for s in kept_sentences if re.search(r'\d', s)]
-    
-    return (
-        f"**🧪 Enhanced Pruning Test**\n\n"
-        f"**Query:** {query}\n\n"
-        f"**Results:**\n"
-        f"- Sentences: {meta['sentences_kept']}/{meta['sentences_total']} "
-        f"({meta['compression']:.1%} compression)\n"
-        f"- Processing: {meta['processing_time']:.3f}s\n"
-        f"- Digit sentences kept: {len(digit_kept)}/{len(digit_sentences)}\n"
-        f"- Head/tail preserved: {meta.get('forced_head_tail', 0)}\n"
-        f"- Neighbor expansion: {'✅' if meta.get('neighbor_expansion') else '❌'}\n\n"
-        f"**Pruned Text:**\n{pruned}"
-    )
+    return f"""**Pruning Test Results**
 
-# ---------------------------------------------------------------------------
-# Startup hook with enhanced preloading and user feedback
-# ---------------------------------------------------------------------------
+Query: "{query}"
+
+Compression: {metadata['compression']:.1%}
+Sentences: {metadata['sentences_kept']}/{metadata['sentences_total']}
+Time: {metadata['processing_time']:.3f}s
+Algorithm: {metadata['algorithm']}
+
+**Pruned Text:**
+{pruned}"""
+
+
 @hook
 def after_cat_bootstrap(cat):
+    """Initialize models on startup."""
     if not ML_AVAILABLE:
-        log.warning("⚠️ Enhanced Pruning: ML stack unavailable. Install requirements: pip install torch sentence-transformers transformers nltk tiktoken scikit-learn")
         return
-
-    def _preload():
+    
+    def preload():
         try:
-            client = _get_client(cat)
+            client = get_client(cat)
             if client:
-                log.info("🚀 Enhanced Pruning: Initializing models...")
-                
-                # Preload embedder
-                embedder = client._load_embedder()
-                log.info(f"✅ Embedder loaded: {client.settings.embed_model}")
-                
-                # Preload classifier if configured
+                # Preload models
+                client._ensure_embedder()
                 if client.settings.classifier_model:
-                    clf = client._load_classifier()
-                    if clf:
-                        log.info("🧠 TRUE Provenance classifier ready - High-quality pruning enabled")
-                    else:
-                        log.warning("⚠️ Classifier failed - Using cosine similarity fallback")
-                        log.info("💡 For better results, try: microsoft/deberta-v3-base")
-                else:
-                    log.info("📐 Using cosine similarity (no classifier configured)")
-                
-                # Test run to validate everything works
-                test_doc = "This is a test sentence for validation. Another sentence follows."
-                test_query = "test validation"
-                try:
-                    pruned, meta = client.prune(test_doc, test_query)
-                    log.info(f"✅ Enhanced Pruning fully operational - Test compression: {meta['compression']:.1%}")
-                except Exception as test_error:
-                    log.error(f"❌ Pruning test failed: {test_error}")
-                
+                    client._ensure_classifier()
+                log.info("Provenance pruning models loaded")
         except Exception as e:
-            log.error(f"❌ Enhanced Pruning initialization failed: {e}")
-            log.error("💡 Try restarting Cheshire Cat or check plugin configuration")
-
-    threading.Thread(target=_preload, daemon=True).start()
+            log.error(f"Model preloading failed: {e}")
+    
+    threading.Thread(target=preload, daemon=True).start()
