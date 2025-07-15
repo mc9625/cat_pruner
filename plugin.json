@@ -1,7 +1,7 @@
 {
     "name": "Provenance Pruning",
-    "version": "1.0.0",
-    "description": "Advanced text pruning to reduce RAG hallucinations with Apple Silicon MPS optimization",
+    "version": "0.1.0",
+   "description": "Intelligent sentence-level document pruning based on query relevance using Provenance algorithm with multiple fallback strategies",
     "author_name": "NuvolaProject",
     "author_url": "https://nuvolaproject.cloud",
     "plugin_url": "https://github.com/mc9625/cat_pruner",
