@@ -1,6 +1,6 @@
 torch>=2.2
 sentence-transformers>=2.4
 transformers>=4.43
-nltk
+nltk==3.8.2
 tiktoken
 scikit-learn
